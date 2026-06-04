@@ -1,6 +1,7 @@
 """
 agent-hub の inbox を listen し、slash command を直接処理する。
 
+agent-hub-sdk の AgentHub.connect() + hub.inbox() を使用。
 @scheduler が /add /list を直接処理するのと同じパターン。
 LLM (Gemini) を経由せず、CommandListener が即座に応答する。
 
@@ -11,13 +12,11 @@ LLM (Gemini) を経由せず、CommandListener が即座に応答する。
 セッション (VoiceSession) とは独立して動作する。
 """
 import asyncio
-import json
 import logging
 
-import httpx
+from agent_hub_sdk import AgentHub
 
 from auth import OTPStore
-from mcp_client import AgentHubMCPClient
 
 logger = logging.getLogger(__name__)
 
@@ -29,33 +28,59 @@ CMD_GENERATE_CODE = "/generate-code"
 
 class CommandListener:
     """
-    voice-gateway の agent-hub handle (@voice 等) の inbox を SSE で listen し、
+    voice-gateway の agent-hub handle (@voice 等) の inbox を SDK で listen し、
     slash command を直接処理するサービス。
 
     /generate-code を受信すると:
       1. OTPStore で 6 桁コードを生成 (TTL 5 分)
       2. 送信者に send_message でコードを返信
-      3. メッセージを mark_as_read
+      3. メッセージを ack (mark_as_read)
 
     LLM を経由しないため、遅延なく即座に応答できる。
     """
 
-    def __init__(self, mcp_client: AgentHubMCPClient, otp_store: OTPStore) -> None:
-        self.mcp = mcp_client
+    def __init__(
+        self,
+        hub_url: str,
+        hub_user: str,
+        hub_pat: str,
+        hub_tenant: str | None,
+        otp_store: OTPStore,
+    ) -> None:
+        self._hub_url = hub_url
+        self._hub_user = hub_user
+        self._hub_pat = hub_pat
+        self._hub_tenant = hub_tenant
         self.otp_store = otp_store
 
     async def run(self) -> None:
-        """初期化後、SSE listen ループを開始する（リトライ付き）。"""
+        """接続・登録後、inbox listen ループを開始する（リトライ付き）。"""
         backoff = 5
         while True:
             try:
-                await self.mcp.initialize()
-                await self.mcp.register(DISPLAY_NAME)
-                logger.info(
-                    "CommandListener: registered as @%s, listening for slash commands",
-                    self.mcp.user,
-                )
-                await self._listen()
+                async with AgentHub.connect(
+                    user=self._hub_user,
+                    url=self._hub_url,
+                    pat=self._hub_pat,
+                    tenant=self._hub_tenant,
+                    display_name=DISPLAY_NAME,
+                ) as hub:
+                    logger.info(
+                        "CommandListener: connected as @%s, listening for slash commands",
+                        self._hub_user,
+                    )
+                    backoff = 5  # 正常接続できたらリセット
+                    async with hub.inbox() as messages:
+                        async for msg in messages:
+                            body = (msg.body or "").strip()
+                            if body.lower() == CMD_GENERATE_CODE:
+                                await self._handle_generate_code(hub, msg.sender, msg.id)
+                            # 未知の slash command / bare text はそのまま ack して無視
+                            # (bare text は Gemini セッション側で処理)
+                            try:
+                                await hub.ack(msg.id)
+                            except Exception as ack_err:
+                                logger.warning("ack failed for %s: %s", msg.id, ack_err)
             except Exception as e:
                 logger.error(
                     "CommandListener error: %s — retry in %ds", e, backoff
@@ -63,56 +88,12 @@ class CommandListener:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
 
-    async def _listen(self) -> None:
-        url = self.mcp.sse_url()
-        async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream(
-                "GET", url, headers=self.mcp._headers()
-            ) as response:
-                async for line in response.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    try:
-                        data = json.loads(line[5:].strip())
-                    except json.JSONDecodeError:
-                        continue
-                    await self._handle_event(data)
-
-    async def _handle_event(self, data: dict) -> None:
-        method = data.get("method", "")
-        if method != "notifications/resources/updated":
-            return
-        uri = data.get("params", {}).get("uri", "")
-        if "inbox://" not in uri:
-            return
-        await self._process_inbox()
-
-    async def _process_inbox(self) -> None:
-        try:
-            messages = await self.mcp.call_tool("get_messages", {"limit": 20})
-        except Exception as e:
-            logger.error("CommandListener get_messages failed: %s", e)
-            return
-
-        if not isinstance(messages, list):
-            return
-
-        for msg in messages:
-            # body をそのまま（strip のみ）で比較。大文字小文字は区別しない。
-            body = (msg.get("body") or "").strip()
-            sender = msg.get("from", "")
-            msg_id = msg.get("id", "")
-
-            if body.lower() == CMD_GENERATE_CODE:
-                await self._handle_generate_code(sender, msg_id)
-            # 未知の slash command は無視 (bare text は Gemini セッション側で処理)
-
-    async def _handle_generate_code(self, sender: str, msg_id: str) -> None:
+    async def _handle_generate_code(self, hub, sender: str, msg_id: str) -> None:
         """
         /generate-code 処理: OTP 生成 → 送信者に返信。
 
         @scheduler の slash command 処理と同じパターン:
-        LLM を経由せず CommandListener が直接 send_message を呼ぶ。
+        LLM を経由せず CommandListener が直接 send を呼ぶ。
         """
         code, ttl = self.otp_store.generate()
         ttl_min = ttl // 60
@@ -121,8 +102,7 @@ class CommandListener:
             f"スマホブラウザでこのコードを入力してセッションを開始してください。"
         )
         try:
-            await self.mcp.call_tool("send_message", {"to": sender, "message": reply})
-            await self.mcp.call_tool("mark_as_read", {"message_id": msg_id})
+            await hub.send(sender, reply)
             # セキュリティ: コードの先頭 2 桁のみログに残す
             logger.info(
                 "/generate-code: sent to %s (code=%s****)", sender, code[:2]

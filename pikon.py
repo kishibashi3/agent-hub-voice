@@ -1,81 +1,53 @@
 """
-agent-hub SSE push を listen し、新メッセージ到着時に callback を呼ぶ。
+agent-hub inbox を SDK の hub.inbox() で listen し、
+新メッセージ到着時に callback を呼ぶ。
 セッション単位でインスタンス化 (browser WS 接続 1 本に 1 インスタンス)。
+
+hub.inbox() は push (SSE) + safety-net poll + heartbeat を内包しているため、
+手動 SSE 実装は不要。
 """
-import asyncio
-import json
 import logging
 from typing import Awaitable, Callable
 
-import httpx
-
-from mcp_client import AgentHubMCPClient
+from agent_hub_sdk import HubSession, IncomingMessage
 
 logger = logging.getLogger(__name__)
 
-OnMessageCallback = Callable[[list[dict]], Awaitable[None]]
+OnMessageCallback = Callable[[list[IncomingMessage]], Awaitable[None]]
 
 
 class PikonListener:
     """
-    SSE push を常時 listen し、inbox 更新時に新メッセージを取得して callback を呼ぶ。
+    SDK hub.inbox() を常時 listen し、メッセージ到着時に callback を呼ぶ。
+
+    VoiceSession が hub を所有し、PikonListener は参照のみ保持する。
+    hub.inbox() のシングルコンシューマー制約により、1 セッションで
+    PikonListener は 1 インスタンスのみ生成すること。
+
+    NOTE: ack は行わない。Gemini セッション (VoiceSession) が
+    mark_as_read ツール呼び出しで明示的に ack する設計。
+    hub.inbox() の in_flight_ids dedup により、同一セッション内では
+    同一メッセージが重複 yield されない。
     """
 
     def __init__(
         self,
-        mcp_client: AgentHubMCPClient,
+        hub: HubSession,
         on_message: OnMessageCallback,
     ) -> None:
-        self.mcp = mcp_client
+        self.hub = hub
         self.on_message = on_message
-        self._stopped = False
 
     def stop(self) -> None:
-        self._stopped = True
+        """停止要求。asyncio タスクキャンセルで実際に停止するため no-op。"""
+        pass
 
     async def listen(self) -> None:
-        """SSE 接続を確立してイベントを受信し続ける。切断時は自動再接続。"""
-        url = self.mcp.sse_url()
-        backoff = 2
-
-        while not self._stopped:
-            try:
-                async with httpx.AsyncClient(timeout=None) as client:
-                    async with client.stream(
-                        "GET", url, headers=self.mcp._headers()
-                    ) as response:
-                        logger.info("PikonListener: SSE connected")
-                        backoff = 2
-                        async for line in response.aiter_lines():
-                            if self._stopped:
-                                return
-                            if not line.startswith("data:"):
-                                continue
-                            try:
-                                data = json.loads(line[5:].strip())
-                            except json.JSONDecodeError:
-                                continue
-                            await self._handle_event(data)
-            except Exception as e:
-                if self._stopped:
-                    return
-                logger.warning(
-                    "PikonListener SSE error: %s — retry in %ds", e, backoff
-                )
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)
-
-    async def _handle_event(self, data: dict) -> None:
-        method = data.get("method", "")
-        if method != "notifications/resources/updated":
-            return
-        uri = data.get("params", {}).get("uri", "")
-        if "inbox://" not in uri:
-            return
-
-        try:
-            messages = await self.mcp.call_tool("get_messages", {"limit": 10})
-            if messages and isinstance(messages, list):
-                await self.on_message(messages)
-        except Exception as e:
-            logger.error("PikonListener get_messages error: %s", e)
+        """hub.inbox() を開き、メッセージ到着のたびに callback を呼ぶ。"""
+        async with self.hub.inbox() as messages:
+            logger.info("PikonListener: inbox listening")
+            async for msg in messages:
+                try:
+                    await self.on_message([msg])
+                except Exception as e:
+                    logger.error("PikonListener on_message error: %s", e)

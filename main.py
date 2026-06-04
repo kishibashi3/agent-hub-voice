@@ -24,7 +24,6 @@ from aiohttp import web
 
 from auth import OTPStore
 from command_listener import CommandListener
-from mcp_client import AgentHubMCPClient
 from session import VoiceSession
 
 logging.basicConfig(
@@ -39,8 +38,10 @@ GATEWAY_PORT = int(os.environ.get("GATEWAY_PORT", "8765"))
 AGENT_HUB_URL = os.environ.get("AGENT_HUB_URL", "http://agent-hub:3000/mcp")
 AGENT_HUB_USER = os.environ.get("AGENT_HUB_USER", "voice")
 AGENT_HUB_TENANT = os.environ.get("AGENT_HUB_TENANT") or None
+# SDK は GitHub PAT を必須とする。trust mode は非対応 (production 専用)。
+# docker-compose は AGENT_HUB_GITHUB_PAT を渡す。SDK の GITHUB_PAT env var とは別名の
+# ため、ここで明示的に取得して connect() に渡す。
 AGENT_HUB_GITHUB_PAT = os.environ.get("AGENT_HUB_GITHUB_PAT") or None
-AGENT_HUB_AUTH_MODE = os.environ.get("AGENT_HUB_AUTH_MODE", "trust")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash-live-001")
 AGENT_HUB_VOICE_PERSONA = os.environ.get(
@@ -62,18 +63,6 @@ otp_store = OTPStore()
 # asyncio.Lock は同一 event loop 内でのみ有効 (single-thread)。
 # locked() チェックと acquire() の間に await がないため TOCTOU は発生しない。
 _session_lock = asyncio.Lock()
-
-
-# ---- MCP クライアントファクトリ -----------------------------------------
-
-def _make_mcp_client() -> AgentHubMCPClient:
-    auth_token = AGENT_HUB_GITHUB_PAT if AGENT_HUB_AUTH_MODE == "pat" else None
-    return AgentHubMCPClient(
-        url=AGENT_HUB_URL,
-        user=AGENT_HUB_USER,
-        tenant=AGENT_HUB_TENANT,
-        auth_token=auth_token,
-    )
 
 
 # ---- HTTP / WS ハンドラ -------------------------------------------------
@@ -114,10 +103,12 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
 
     logger.info("WS connected: %s", request.remote)
     async with _session_lock:
-        mcp = _make_mcp_client()
         session = VoiceSession(
             browser_ws=ws,
-            mcp_client=mcp,
+            hub_url=AGENT_HUB_URL,
+            hub_user=AGENT_HUB_USER,
+            hub_pat=AGENT_HUB_GITHUB_PAT,
+            hub_tenant=AGENT_HUB_TENANT,
             gemini_api_key=GEMINI_API_KEY,
             gemini_model=GEMINI_MODEL,
             system_prompt=AGENT_HUB_VOICE_PERSONA,
@@ -159,8 +150,13 @@ def build_app() -> web.Application:
 
 async def main() -> None:
     # CommandListener (OTP 発行 + agent-hub inbox listen) 起動
-    cmd_mcp = _make_mcp_client()
-    cmd_listener = CommandListener(mcp_client=cmd_mcp, otp_store=otp_store)
+    cmd_listener = CommandListener(
+        hub_url=AGENT_HUB_URL,
+        hub_user=AGENT_HUB_USER,
+        hub_pat=AGENT_HUB_GITHUB_PAT,
+        hub_tenant=AGENT_HUB_TENANT,
+        otp_store=otp_store,
+    )
     cmd_task = asyncio.create_task(cmd_listener.run(), name="command_listener")
 
     # HTTP / WS サーバー起動

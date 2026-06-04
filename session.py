@@ -3,7 +3,7 @@ VoiceSession — browser WebSocket ↔ Gemini Live 1:1 セッション。
 
 ライフサイクル:
   1. OTP 認証 (auth.py)
-  2. MCP initialize
+  2. agent-hub SDK 接続 (AgentHub.connect)
   3. Gemini Live 接続
   4. 音声・制御メッセージの双方向中継
   5. 切断時クリーンアップ
@@ -16,10 +16,11 @@ import logging
 from aiohttp import WSMsgType, web
 from google.genai import types
 
+from agent_hub_sdk import AgentHub, IncomingMessage
+
 from auth import OTPStore
 from functions import VOICE_TOOLS
 from gemini_client import GeminiLiveClient
-from mcp_client import AgentHubMCPClient
 from pikon import PikonListener
 
 logger = logging.getLogger(__name__)
@@ -36,14 +37,20 @@ class VoiceSession:
     def __init__(
         self,
         browser_ws: web.WebSocketResponse,
-        mcp_client: AgentHubMCPClient,
+        hub_url: str,
+        hub_user: str,
+        hub_pat: str,
+        hub_tenant: str | None,
         gemini_api_key: str,
         gemini_model: str,
         system_prompt: str,
         otp_store: OTPStore,
     ) -> None:
         self.ws = browser_ws
-        self.mcp = mcp_client
+        self._hub_url = hub_url
+        self._hub_user = hub_user
+        self._hub_pat = hub_pat
+        self._hub_tenant = hub_tenant
         self.gemini_api_key = gemini_api_key
         self.gemini_model = gemini_model
         self.system_prompt = system_prompt
@@ -51,8 +58,9 @@ class VoiceSession:
 
         self.gemini_session = None
         self.is_gemini_speaking = False
-        self._pending_messages: list[dict] = []
+        self._pending_messages: list[IncomingMessage] = []
         self._pikon_listener: PikonListener | None = None
+        self._hub = None  # 接続中の HubSession (tool dispatch 用)
 
     # =========================================================================
     # メインエントリ
@@ -63,13 +71,23 @@ class VoiceSession:
         if not await self._authenticate():
             return
 
-        # Step 2: MCP 初期化
+        # Step 2: agent-hub 接続
         try:
-            await self.mcp.initialize()
+            async with AgentHub.connect(
+                user=self._hub_user,
+                url=self._hub_url,
+                pat=self._hub_pat,
+                tenant=self._hub_tenant,
+            ) as hub:
+                self._hub = hub
+                await self._run_with_hub(hub)
         except Exception as e:
-            await self._send_error("mcp_init_failed", str(e))
-            return
+            logger.exception("VoiceSession hub connect failed: %s", e)
+            await self._send_error("hub_connect_failed", str(e))
+        finally:
+            self._hub = None
 
+    async def _run_with_hub(self, hub) -> None:
         # Step 3: Gemini Live 接続 + メインループ
         gemini = GeminiLiveClient(
             api_key=self.gemini_api_key,
@@ -79,7 +97,7 @@ class VoiceSession:
         )
 
         self._pikon_listener = PikonListener(
-            mcp_client=self.mcp,
+            hub=hub,
             on_message=self._on_pikon,
         )
 
@@ -87,7 +105,7 @@ class VoiceSession:
             async with gemini.connect() as session:
                 self.gemini_session = session
                 await self._send_json({"type": "session_ready"})
-                logger.info("VoiceSession ready (user=%s)", self.mcp.user)
+                logger.info("VoiceSession ready (user=%s)", self._hub_user)
                 await self._main_loop(session)
         except Exception as e:
             logger.exception("VoiceSession error: %s", e)
@@ -111,7 +129,7 @@ class VoiceSession:
 
         try:
             # どれか 1 つが完了 (= 切断 / エラー) したら残りをキャンセル
-            done, pending = await asyncio.wait(
+            await asyncio.wait(
                 {browser_task, gemini_task, pikon_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
@@ -251,7 +269,7 @@ class VoiceSession:
             await self._inject_pending_messages()
 
     async def _handle_tool_call(self, tool_call) -> None:
-        """Gemini function call を MCP tool call に変換して実行する。"""
+        """Gemini function call を hub tool call に変換して実行する。"""
         responses = []
         for fn in tool_call.function_calls:
             logger.info("Tool call: %s(%s)", fn.name, fn.args)
@@ -265,28 +283,71 @@ class VoiceSession:
             )
 
     async def _dispatch_function(self, name: str, args: dict) -> dict:
+        """Gemini から呼ばれた function を hub API に変換して実行する。"""
+        hub = self._hub
+        if hub is None:
+            return {"error": "hub not connected", "success": False}
         try:
-            result = await self.mcp.call_tool(name, args)
-            return {"result": result, "success": True}
+            if name == "send_message":
+                await hub.send(args["to"], args["message"])
+                return {"result": "sent", "success": True}
+
+            elif name == "get_messages":
+                messages = await hub.get_unread()
+                result = [
+                    {
+                        "id": m.id,
+                        "from": m.sender,
+                        "body": m.body,
+                        "timestamp": m.timestamp,
+                    }
+                    for m in messages
+                ]
+                return {"result": result, "success": True}
+
+            elif name == "get_participants":
+                participants = await hub.get_participants()
+                result = [
+                    {
+                        "name": p.name,
+                        "display_name": p.display_name,
+                        "mode": p.mode,
+                        "is_online": p.is_online,
+                    }
+                    for p in participants
+                ]
+                return {"result": result, "success": True}
+
+            elif name == "mark_as_read":
+                await hub.ack(args["message_id"])
+                return {"result": "marked", "success": True}
+
+            elif name == "get_history":
+                text = await hub._call_tool_raw("get_history", args)
+                return {"result": text, "success": True}
+
+            else:
+                return {"error": f"unknown tool: {name}", "success": False}
+
         except Exception as e:
-            logger.error("MCP tool error [%s]: %s", name, e)
+            logger.error("Hub tool error [%s]: %s", name, e)
             return {"error": str(e), "success": False}
 
     # =========================================================================
     # pikon! 通知
     # =========================================================================
 
-    async def _on_pikon(self, messages: list[dict]) -> None:
-        """SSE push による新メッセージ到着通知。"""
+    async def _on_pikon(self, messages: list[IncomingMessage]) -> None:
+        """SDK inbox() による新メッセージ到着通知。"""
         if not messages:
             return
 
         # pikon! 通知を browser に送信
         first = messages[0]
-        preview = (first.get("body") or "")[:50]
+        preview = (first.body or "")[:50]
         await self._send_json({
             "type": "pikon",
-            "from": first.get("from", ""),
+            "from": first.sender,
             "preview": preview,
         })
 
@@ -297,39 +358,33 @@ class VoiceSession:
             await self._inject_messages_to_gemini(messages)
 
     async def _inject_pending_messages(self) -> None:
-        """turnComplete 時に pending メッセージ + 最新未読を Gemini context に注入する。"""
-        try:
-            fresh = await self.mcp.call_tool("get_messages", {"limit": 5})
-            if fresh and isinstance(fresh, list):
-                self._pending_messages.extend(fresh)
-        except Exception:
-            pass  # MCP 障害は無視して音声会話を継続
+        """turnComplete 時に pending メッセージを Gemini context に注入する。
 
+        PikonListener (hub.inbox()) が push/poll でメッセージを届けるため、
+        ここでは _pending_messages バッファのみを処理する。
+        """
         if not self._pending_messages:
             return
 
         # 重複排除 (id で)
         seen: set[str] = set()
-        unique = []
+        unique: list[IncomingMessage] = []
         for m in self._pending_messages:
-            mid = m.get("id", "")
-            if mid not in seen:
-                seen.add(mid)
+            if m.id not in seen:
+                seen.add(m.id)
                 unique.append(m)
 
         self._pending_messages.clear()
         await self._inject_messages_to_gemini(unique[:5])  # 最大 5 件
 
-    async def _inject_messages_to_gemini(self, messages: list[dict]) -> None:
+    async def _inject_messages_to_gemini(self, messages: list[IncomingMessage]) -> None:
         """メッセージリストを Gemini context として注入する。"""
         if not self.gemini_session or not messages:
             return
 
         lines = ["【agent-hub 未読メッセージ】"]
         for m in messages:
-            sender = m.get("from", "")
-            body = m.get("body", "")
-            lines.append(f"  {sender}: {body}")
+            lines.append(f"  {m.sender}: {m.body}")
         context_text = "\n".join(lines)
 
         try:
