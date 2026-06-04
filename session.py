@@ -1,31 +1,38 @@
 """
-VoiceSession — browser WebSocket ↔ Gemini Live 1:1 セッション。
+VoiceSession — browser WebSocket ↔ Gemini Live 1:1 セッション (ADK ベース)。
 
 ライフサイクル:
   1. OTP 認証 (auth.py)
   2. agent-hub SDK 接続 (AgentHub.connect)
-  3. Gemini Live 接続
-  4. 音声・制御メッセージの双方向中継
-  5. 切断時クリーンアップ
+  3. hub_tools モジュール変数にセッションを注入
+  4. ADK セッション作成 (InMemorySessionService)
+  5. Runner.run_live() で upstream / downstream 並行実行
+     - upstream: browser PCM → LiveRequestQueue.send_realtime()
+     - downstream: Runner イベント → browser WS (audio bytes / transcript JSON)
+  6. pikon listener で hub inbox を監視し、未読を context 注入
+  7. 切断時クリーンアップ (hub_tools.clear_hub_session / queue.close)
 """
 import asyncio
-import base64
 import json
 import logging
+import uuid
 
 from aiohttp import WSMsgType, web
+from google.adk.agents import LiveRequestQueue
+from google.adk.runners import RunConfig
 from google.genai import types
 
 from agent_hub_sdk import AgentHub, IncomingMessage
 
 from auth import OTPStore
-from functions import VOICE_TOOLS
-from gemini_client import GeminiLiveClient
+import hub_tools
+from gemini_client import APP_NAME, create_voice_runner
 from pikon import PikonListener
 
 logger = logging.getLogger(__name__)
 
 AUTH_TIMEOUT = 30  # 秒: OTP 入力待ちタイムアウト
+VOICE_NAME = "Kore"
 
 
 class VoiceSession:
@@ -51,16 +58,20 @@ class VoiceSession:
         self._hub_user = hub_user
         self._hub_pat = hub_pat
         self._hub_tenant = hub_tenant
-        self.gemini_api_key = gemini_api_key
-        self.gemini_model = gemini_model
-        self.system_prompt = system_prompt
         self.otp_store = otp_store
 
-        self.gemini_session = None
+        # ADK Runner (セッションごとに生成)
+        self._runner, self._session_service = create_voice_runner(
+            api_key=gemini_api_key,
+            model=gemini_model,
+            system_prompt=system_prompt,
+        )
+        self._adk_session_id: str | None = None
+
         self.is_gemini_speaking = False
         self._pending_messages: list[IncomingMessage] = []
         self._pikon_listener: PikonListener | None = None
-        self._hub = None  # 接続中の HubSession (tool dispatch 用)
+        self._queue: LiveRequestQueue | None = None
 
     # =========================================================================
     # メインエントリ
@@ -79,49 +90,70 @@ class VoiceSession:
                 pat=self._hub_pat,
                 tenant=self._hub_tenant,
             ) as hub:
-                self._hub = hub
                 await self._run_with_hub(hub)
         except Exception as e:
             logger.exception("VoiceSession hub connect failed: %s", e)
             await self._send_error("hub_connect_failed", str(e))
-        finally:
-            self._hub = None
 
     async def _run_with_hub(self, hub) -> None:
-        # Step 3: Gemini Live 接続 + メインループ
-        gemini = GeminiLiveClient(
-            api_key=self.gemini_api_key,
-            model=self.gemini_model,
-            tools=VOICE_TOOLS,
-            system_prompt=self.system_prompt,
-        )
-
-        self._pikon_listener = PikonListener(
-            hub=hub,
-            on_message=self._on_pikon,
-        )
+        """hub 接続中の処理。hub_tools モジュール変数を通じてツールに hub を渡す。"""
+        hub_tools.set_hub_session(hub)
+        self._pikon_listener = PikonListener(hub=hub, on_message=self._on_pikon)
 
         try:
-            async with gemini.connect() as session:
-                self.gemini_session = session
-                await self._send_json({"type": "session_ready"})
-                logger.info("VoiceSession ready (user=%s)", self._hub_user)
-                await self._main_loop(session)
+            await self._run_adk_session()
         except Exception as e:
             logger.exception("VoiceSession error: %s", e)
             await self._send_error("session_error", str(e))
         finally:
-            self.gemini_session = None
+            hub_tools.clear_hub_session()
             if self._pikon_listener:
                 self._pikon_listener.stop()
 
-    async def _main_loop(self, session) -> None:
-        """browser_recv / gemini_recv / pikon を並行実行し、どれかが終了したら全停止。"""
-        browser_task = asyncio.create_task(
-            self._browser_recv_loop(), name="browser_recv"
+    async def _run_adk_session(self) -> None:
+        """ADK セッションを作成し upstream / downstream / pikon を並行実行する。"""
+        # ADK セッション作成
+        self._adk_session_id = str(uuid.uuid4())
+        await self._session_service.create_session(
+            app_name=APP_NAME,
+            user_id=self._hub_user,
+            session_id=self._adk_session_id,
         )
-        gemini_task = asyncio.create_task(
-            self._gemini_recv_loop(session), name="gemini_recv"
+
+        self._queue = LiveRequestQueue()
+        run_config = RunConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name=VOICE_NAME
+                    )
+                )
+            ),
+        )
+
+        await self._send_json({"type": "session_ready"})
+        logger.info(
+            "VoiceSession ready (user=%s, adk_session=%s)",
+            self._hub_user,
+            self._adk_session_id,
+        )
+
+        try:
+            await self._main_loop(run_config)
+        finally:
+            if self._queue:
+                self._queue.close()
+                self._queue = None
+            self._adk_session_id = None
+
+    async def _main_loop(self, run_config: RunConfig) -> None:
+        """upstream / downstream / pikon を並行実行し、どれかが終了したら全停止。"""
+        upstream_task = asyncio.create_task(
+            self._browser_recv_loop(), name="upstream"
+        )
+        downstream_task = asyncio.create_task(
+            self._gemini_recv_loop(run_config), name="downstream"
         )
         pikon_task = asyncio.create_task(
             self._pikon_listener.listen(), name="pikon"
@@ -130,13 +162,15 @@ class VoiceSession:
         try:
             # どれか 1 つが完了 (= 切断 / エラー) したら残りをキャンセル
             await asyncio.wait(
-                {browser_task, gemini_task, pikon_task},
+                {upstream_task, downstream_task, pikon_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
         finally:
-            for t in [browser_task, gemini_task, pikon_task]:
+            for t in [upstream_task, downstream_task, pikon_task]:
                 t.cancel()
-            await asyncio.gather(browser_task, gemini_task, pikon_task, return_exceptions=True)
+            await asyncio.gather(
+                upstream_task, downstream_task, pikon_task, return_exceptions=True
+            )
 
     # =========================================================================
     # 認証
@@ -151,7 +185,9 @@ class VoiceSession:
             return False
 
         if msg.type != WSMsgType.TEXT:
-            await self._send_error("auth_failed", "最初のメッセージは JSON テキストである必要があります")
+            await self._send_error(
+                "auth_failed", "最初のメッセージは JSON テキストである必要があります"
+            )
             return False
 
         try:
@@ -178,14 +214,14 @@ class VoiceSession:
         return True
 
     # =========================================================================
-    # browser → Gemini
+    # browser → ADK (upstream)
     # =========================================================================
 
     async def _browser_recv_loop(self) -> None:
         """ブラウザからのメッセージ (PCM audio / control JSON) を処理する。"""
         async for msg in self.ws:
             if msg.type == WSMsgType.BINARY:
-                await self._send_audio_to_gemini(msg.data)
+                self._send_audio_to_queue(msg.data)
             elif msg.type == WSMsgType.TEXT:
                 try:
                     await self._handle_control(json.loads(msg.data))
@@ -198,22 +234,17 @@ class VoiceSession:
                 logger.error("Browser WS error")
                 return
 
-    async def _send_audio_to_gemini(self, pcm: bytes) -> None:
-        if not self.gemini_session:
+    def _send_audio_to_queue(self, pcm: bytes) -> None:
+        """PCM 音声データを LiveRequestQueue に送信する (同期)。"""
+        queue = self._queue
+        if queue is None:
             return
         try:
-            await self.gemini_session.send(
-                input=types.LiveClientRealtimeInput(
-                    media_chunks=[
-                        types.Blob(
-                            data=base64.b64encode(pcm).decode(),
-                            mime_type="audio/pcm;rate=16000",
-                        )
-                    ]
-                )
+            queue.send_realtime(
+                blob=types.Blob(data=pcm, mime_type="audio/pcm;rate=16000")
             )
         except Exception as e:
-            logger.error("Failed to send audio to Gemini: %s", e)
+            logger.error("Failed to send audio to queue: %s", e)
 
     async def _handle_control(self, msg: dict) -> None:
         t = msg.get("type")
@@ -226,112 +257,59 @@ class VoiceSession:
             await self.ws.close()
 
     # =========================================================================
-    # Gemini → browser
+    # ADK → browser (downstream)
     # =========================================================================
 
-    async def _gemini_recv_loop(self, session) -> None:
-        """Gemini からのメッセージ (audio / function call) を処理する。"""
-        async for message in session.receive():
-            if message.server_content:
-                await self._handle_server_content(message.server_content)
-            elif message.tool_call:
-                await self._handle_tool_call(message.tool_call)
-
-    async def _handle_server_content(self, sc) -> None:
-        # model audio → browser
-        if sc.model_turn:
-            self.is_gemini_speaking = True
-            for part in sc.model_turn.parts:
-                if part.inline_data:
-                    audio = base64.b64decode(part.inline_data.data)
-                    try:
-                        await self.ws.send_bytes(audio)
-                    except Exception:
-                        return  # WS closed
-
-        # transcript → browser
-        if sc.input_transcription:
-            await self._send_json({
-                "type": "transcript",
-                "speaker": "user",
-                "text": sc.input_transcription.text,
-            })
-        if sc.output_transcription:
-            await self._send_json({
-                "type": "transcript",
-                "speaker": "model",
-                "text": sc.output_transcription.text,
-            })
-
-        # turnComplete: ユーザー発話確定 → 未読メッセージ注入
-        if sc.turn_complete:
-            self.is_gemini_speaking = False
-            await self._inject_pending_messages()
-
-    async def _handle_tool_call(self, tool_call) -> None:
-        """Gemini function call を hub tool call に変換して実行する。"""
-        responses = []
-        for fn in tool_call.function_calls:
-            logger.info("Tool call: %s(%s)", fn.name, fn.args)
-            result = await self._dispatch_function(fn.name, dict(fn.args or {}))
-            responses.append(
-                types.FunctionResponse(name=fn.name, id=fn.id, response=result)
-            )
-        if self.gemini_session:
-            await self.gemini_session.send(
-                input=types.LiveClientToolResponse(function_responses=responses)
-            )
-
-    async def _dispatch_function(self, name: str, args: dict) -> dict:
-        """Gemini から呼ばれた function を hub API に変換して実行する。"""
-        hub = self._hub
-        if hub is None:
-            return {"error": "hub not connected", "success": False}
+    async def _gemini_recv_loop(self, run_config: RunConfig) -> None:
+        """ADK Runner からのイベント (audio / transcript / turn_complete) を処理する。"""
         try:
-            if name == "send_message":
-                await hub.send(args["to"], args["message"])
-                return {"result": "sent", "success": True}
+            async for event in self._runner.run_live(
+                user_id=self._hub_user,
+                session_id=self._adk_session_id,
+                live_request_queue=self._queue,
+                run_config=run_config,
+            ):
+                # 音声コンテンツをブラウザに転送
+                if event.content and event.content.parts:
+                    self.is_gemini_speaking = True
+                    for part in event.content.parts:
+                        if part.inline_data:
+                            try:
+                                await self.ws.send_bytes(part.inline_data.data)
+                            except Exception:
+                                return  # WS closed
 
-            elif name == "get_messages":
-                messages = await hub.get_unread()
-                result = [
-                    {
-                        "id": m.id,
-                        "from": m.sender,
-                        "body": m.body,
-                        "timestamp": m.timestamp,
-                    }
-                    for m in messages
-                ]
-                return {"result": result, "success": True}
+                # トランスクリプト
+                # NOTE: ADK バージョンによって transcription フィールドが
+                #       str または .text 属性を持つオブジェクトになる場合がある。
+                #       runtime で正規化して送信する。
+                if event.input_transcription:
+                    text = event.input_transcription
+                    if hasattr(text, "text"):
+                        text = text.text
+                    await self._send_json({
+                        "type": "transcript",
+                        "speaker": "user",
+                        "text": str(text),
+                    })
+                if event.output_transcription:
+                    text = event.output_transcription
+                    if hasattr(text, "text"):
+                        text = text.text
+                    await self._send_json({
+                        "type": "transcript",
+                        "speaker": "model",
+                        "text": str(text),
+                    })
 
-            elif name == "get_participants":
-                participants = await hub.get_participants()
-                result = [
-                    {
-                        "name": p.name,
-                        "display_name": p.display_name,
-                        "mode": p.mode,
-                        "is_online": p.is_online,
-                    }
-                    for p in participants
-                ]
-                return {"result": result, "success": True}
-
-            elif name == "mark_as_read":
-                await hub.ack(args["message_id"])
-                return {"result": "marked", "success": True}
-
-            elif name == "get_history":
-                text = await hub._call_tool_raw("get_history", args)
-                return {"result": text, "success": True}
-
-            else:
-                return {"error": f"unknown tool: {name}", "success": False}
+                # ターン完了: pending メッセージを Gemini context に注入
+                if event.turn_complete:
+                    self.is_gemini_speaking = False
+                    await self._inject_pending_messages()
 
         except Exception as e:
-            logger.error("Hub tool error [%s]: %s", name, e)
-            return {"error": str(e), "success": False}
+            logger.error("Gemini recv loop error: %s", e)
+            await self._send_error("gemini_error", str(e))
 
     # =========================================================================
     # pikon! 通知
@@ -378,8 +356,9 @@ class VoiceSession:
         await self._inject_messages_to_gemini(unique[:5])  # 最大 5 件
 
     async def _inject_messages_to_gemini(self, messages: list[IncomingMessage]) -> None:
-        """メッセージリストを Gemini context として注入する。"""
-        if not self.gemini_session or not messages:
+        """メッセージリストを LiveRequestQueue 経由で Gemini context に注入する。"""
+        queue = self._queue
+        if queue is None or not messages:
             return
 
         lines = ["【agent-hub 未読メッセージ】"]
@@ -388,15 +367,14 @@ class VoiceSession:
         context_text = "\n".join(lines)
 
         try:
-            await self.gemini_session.send(
-                input=types.LiveClientContent(
-                    turns=[
-                        types.Content(
-                            role="user",
-                            parts=[types.Part(text=context_text)],
-                        )
-                    ],
-                    turn_complete=False,  # 音声入力を待つ（Gemini に即答させない）
+            # NOTE: send_content() はモデルに即時応答を促す挙動になる場合がある。
+            # 注入は常に turn_complete 直後 (ユーザーが発話していないタイミング) に
+            # 行うことで、発話中に割り込まない設計にしている。
+            # ただしモデルが即座に音声で返答するかは実装依存。
+            queue.send_content(
+                content=types.Content(
+                    role="user",
+                    parts=[types.Part(text=context_text)],
                 )
             )
             logger.info("Injected %d messages to Gemini context", len(messages))
