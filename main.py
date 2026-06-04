@@ -6,10 +6,16 @@ aiohttp を使って以下を 1 ポートで提供:
   GET /voice.js → static/voice.js
   GET /worklet.js → static/worklet.js
   GET /manifest.json → static/manifest.json
-  GET /health   → 200 {"status":"ok"}
+  GET /health   → 200 {"status":"ok","session_active":bool}
   GET /ws       → WebSocket upgrade (VoiceSession)
+
+単一セッション制約:
+  agent-hub は single PAT mode のため複数接続しても全員が同一 identity になる。
+  そのため voice-gateway は同時接続を 1 セッションに制限する。
+  2 本目の接続は "session_in_use" エラーで即時拒否。
 """
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
@@ -52,6 +58,11 @@ STATIC_DIR = Path(__file__).parent / "static"
 # Singleton OTP store (全セッション共有)
 otp_store = OTPStore()
 
+# 単一セッション強制ロック。
+# asyncio.Lock は同一 event loop 内でのみ有効 (single-thread)。
+# locked() チェックと acquire() の間に await がないため TOCTOU は発生しない。
+_session_lock = asyncio.Lock()
+
 
 # ---- MCP クライアントファクトリ -----------------------------------------
 
@@ -68,32 +79,57 @@ def _make_mcp_client() -> AgentHubMCPClient:
 # ---- HTTP / WS ハンドラ -------------------------------------------------
 
 async def handle_health(request: web.Request) -> web.Response:
+    """ヘルスチェック。セッション状態も返す。"""
     return web.Response(
-        text='{"status":"ok"}',
+        text=json.dumps({
+            "status": "ok",
+            "session_active": _session_lock.locked(),
+        }),
         content_type="application/json",
     )
 
 
 async def handle_ws(request: web.Request) -> web.WebSocketResponse:
+    """
+    WebSocket ハンドラ。
+
+    単一セッション制約:
+      _session_lock.locked() が True の場合は session_in_use エラーを返して即閉鎖。
+      locked() チェックと async with _session_lock の間に await がないため安全。
+    """
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    logger.info("WS connected: %s", request.remote)
 
-    mcp = _make_mcp_client()
-    session = VoiceSession(
-        browser_ws=ws,
-        mcp_client=mcp,
-        gemini_api_key=GEMINI_API_KEY,
-        gemini_model=GEMINI_MODEL,
-        system_prompt=AGENT_HUB_VOICE_PERSONA,
-        otp_store=otp_store,
-    )
-    try:
-        await session.run()
-    except Exception:
-        logger.exception("Session crashed")
-    finally:
-        logger.info("WS disconnected: %s", request.remote)
+    # ---- 単一セッション強制 ----
+    if _session_lock.locked():
+        logger.warning("WS rejected (session in use): %s", request.remote)
+        await ws.send_json({
+            "type": "error",
+            "code": "session_in_use",
+            "message": "別のセッションが既にアクティブです。接続中のセッションが終了してから再接続してください。",
+        })
+        await asyncio.sleep(0.1)
+        await ws.close()
+        return ws
+
+    logger.info("WS connected: %s", request.remote)
+    async with _session_lock:
+        mcp = _make_mcp_client()
+        session = VoiceSession(
+            browser_ws=ws,
+            mcp_client=mcp,
+            gemini_api_key=GEMINI_API_KEY,
+            gemini_model=GEMINI_MODEL,
+            system_prompt=AGENT_HUB_VOICE_PERSONA,
+            otp_store=otp_store,
+        )
+        try:
+            await session.run()
+        except Exception:
+            logger.exception("Session crashed")
+        finally:
+            logger.info("WS disconnected: %s", request.remote)
+
     return ws
 
 
@@ -133,7 +169,7 @@ async def main() -> None:
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", GATEWAY_PORT)
     await site.start()
-    logger.info("voice-gateway started on :%d", GATEWAY_PORT)
+    logger.info("voice-gateway started on :%d (single-session mode)", GATEWAY_PORT)
 
     try:
         await asyncio.get_event_loop().create_future()  # run forever

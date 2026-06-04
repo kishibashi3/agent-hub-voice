@@ -127,7 +127,8 @@ class VoiceGatewayClient {
 
       case 'error':
         console.error('[voice-gateway] error:', msg.code, msg.message);
-        this._setStatus('error: ' + msg.code);
+        // session_in_use は専用ステータスで UI に通知 (index.html 側で明確なメッセージを表示)
+        this._setStatus(msg.code === 'session_in_use' ? 'session_in_use' : 'error: ' + msg.code);
         this.disconnect();
         break;
     }

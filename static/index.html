@@ -266,27 +266,41 @@
   // ---- Status management ----
 
   function updateStatus(s) {
-    statusBadge.textContent = s;
     statusBadge.className = 'status-badge';
 
     if (s === 'listening') {
       // 認証完了 → voice panel に切り替え
+      statusBadge.textContent = '🎙 話しかけてください';
       authPanel.style.display = 'none';
       voicePanel.style.display = 'block';
       micBtn.classList.add('listening');
       statusBadge.classList.add('listening');
     } else if (s === 'auth_ok' || s === 'ready') {
+      statusBadge.textContent = '接続中...';
       authPanel.style.display = 'none';
       voicePanel.style.display = 'block';
       statusBadge.classList.add('ready');
-    } else if (s === 'disconnected' || s.startsWith('error')) {
-      // 切断 / エラー → auth panel に戻る
+    } else if (s === 'session_in_use') {
+      // 単一セッション制約: 別の接続がアクティブ
+      statusBadge.textContent = s;
       authPanel.style.display = 'block';
       voicePanel.style.display = 'none';
       micBtn.classList.remove('listening');
       connectBtn.disabled = false;
       otpInput.value = '';
       client = null;
+      showErrorBanner('セッション使用中', '別のデバイスで既にセッションが開いています。そちらを切断してから再接続してください。');
+    } else if (s === 'disconnected' || s.startsWith('error')) {
+      // 切断 / その他エラー → auth panel に戻る
+      statusBadge.textContent = s;
+      authPanel.style.display = 'block';
+      voicePanel.style.display = 'none';
+      micBtn.classList.remove('listening');
+      connectBtn.disabled = false;
+      otpInput.value = '';
+      client = null;
+    } else {
+      statusBadge.textContent = s;
     }
   }
 
@@ -314,6 +328,30 @@
       banner.style.transition = 'opacity 0.3s';
       setTimeout(() => banner.remove(), 300);
     }, 3700);
+  }
+
+  // ---- error banner (session_in_use 等) ----
+
+  function showErrorBanner(title, body) {
+    const banner = document.createElement('div');
+    banner.style.cssText = [
+      'position:fixed', 'top:max(1rem,env(safe-area-inset-top))',
+      'left:50%', 'transform:translateX(-50%)',
+      'background:#3a0000', 'border:1px solid #cc3333',
+      'border-radius:10px', 'padding:.75rem 1.2rem',
+      'font-size:.82rem', 'max-width:min(340px,90vw)',
+      'z-index:100', 'pointer-events:none',
+      'animation:slideDown .2s ease forwards',
+    ].join(';');
+    const safeTitle = String(title).replace(/</g, '&lt;');
+    const safeBody  = String(body).replace(/</g, '&lt;');
+    banner.innerHTML = `<strong style="color:#ff6666">${safeTitle}</strong><br>${safeBody}`;
+    document.body.appendChild(banner);
+    setTimeout(() => {
+      banner.style.opacity = '0';
+      banner.style.transition = 'opacity .3s';
+      setTimeout(() => banner.remove(), 300);
+    }, 6000);
   }
 </script>
 </body>
