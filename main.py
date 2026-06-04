@@ -43,7 +43,7 @@ AGENT_HUB_TENANT = os.environ.get("AGENT_HUB_TENANT") or None
 # ため、ここで明示的に取得して connect() に渡す。
 AGENT_HUB_GITHUB_PAT = os.environ.get("AGENT_HUB_GITHUB_PAT") or None
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash-live-001")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-live-preview")
 AGENT_HUB_VOICE_PERSONA = os.environ.get(
     "AGENT_HUB_VOICE_PERSONA",
     (
