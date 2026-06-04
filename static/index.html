@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>agent-hub voice</title>
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#1a1a2e">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Hiragino Sans', sans-serif;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 1.5rem env(safe-area-inset-right) 1.5rem env(safe-area-inset-left);
+    }
+
+    .container {
+      width: 100%;
+      max-width: 380px;
+    }
+
+    h1 {
+      font-size: 1.3rem;
+      font-weight: 700;
+      text-align: center;
+      margin-bottom: 2rem;
+      color: #a0a0ff;
+      letter-spacing: 0.05em;
+    }
+
+    /* ========== Auth Panel ========== */
+    #authPanel { display: block; }
+    #voicePanel { display: none; }
+
+    .hint {
+      text-align: center;
+      color: #888;
+      font-size: 0.85rem;
+      margin-bottom: 1.5rem;
+      line-height: 1.6;
+    }
+
+    .otp-input {
+      display: block;
+      width: 100%;
+      font-size: 2.2rem;
+      letter-spacing: 0.6rem;
+      text-align: center;
+      padding: 0.75rem 0.5rem;
+      background: #16213e;
+      border: 2px solid #334;
+      border-radius: 10px;
+      color: #fff;
+      margin-bottom: 1rem;
+      caret-color: #a0a0ff;
+    }
+    .otp-input:focus {
+      outline: none;
+      border-color: #6060ff;
+      box-shadow: 0 0 0 3px rgba(96, 96, 255, 0.2);
+    }
+
+    .btn {
+      display: block;
+      width: 100%;
+      padding: 0.9rem;
+      font-size: 1rem;
+      font-weight: 600;
+      border: none;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: opacity 0.15s, transform 0.1s;
+    }
+    .btn:active { transform: scale(0.98); }
+    .btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+    .btn-primary { background: #5c5cff; color: #fff; }
+    .btn-primary:not(:disabled):hover { background: #4a4aee; }
+    .btn-danger  { background: #cc3333; color: #fff; }
+    .btn-danger:not(:disabled):hover { background: #bb2222; }
+
+    /* ========== Voice Panel ========== */
+    .status-badge {
+      text-align: center;
+      font-size: 0.8rem;
+      color: #666;
+      margin-bottom: 1.5rem;
+      min-height: 1.2em;
+      transition: color 0.3s;
+    }
+    .status-badge.listening { color: #4caf50; }
+    .status-badge.ready     { color: #88aaff; }
+
+    .mic-btn-wrap {
+      display: flex;
+      justify-content: center;
+      margin-bottom: 2rem;
+    }
+    .mic-btn {
+      width: 96px;
+      height: 96px;
+      border-radius: 50%;
+      background: #2a2a5a;
+      border: 3px solid #5c5cff;
+      cursor: default; /* VAD はサーバー側 */
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 2.2rem;
+      transition: background 0.3s, box-shadow 0.3s;
+    }
+    .mic-btn.listening {
+      background: #3a0000;
+      border-color: #cc3333;
+      box-shadow: 0 0 0 0 rgba(204, 51, 51, 0.5);
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(204, 51, 51, 0.5); }
+      50%       { box-shadow: 0 0 0 14px rgba(204, 51, 51, 0); }
+    }
+
+    .transcript {
+      background: #16213e;
+      border-radius: 10px;
+      padding: 1rem;
+      min-height: 110px;
+      max-height: 260px;
+      overflow-y: auto;
+      font-size: 0.875rem;
+      line-height: 1.55;
+      margin-bottom: 1rem;
+      scrollbar-width: thin;
+      scrollbar-color: #334 transparent;
+    }
+    .transcript p { margin-bottom: 0.4rem; }
+    .transcript .user  { color: #a0a0ff; }
+    .transcript .model { color: #d8d8d8; }
+
+    .disconnect-btn { margin-top: 0; }
+
+    /* ========== pikon! banner ========== */
+    .pikon-banner {
+      position: fixed;
+      top: max(1rem, env(safe-area-inset-top));
+      left: 50%;
+      transform: translateX(-50%);
+      background: #1e1e4a;
+      border: 1px solid #5c5cff;
+      border-radius: 10px;
+      padding: 0.7rem 1.2rem;
+      font-size: 0.82rem;
+      max-width: min(320px, 90vw);
+      z-index: 100;
+      animation: slideDown 0.2s ease forwards;
+      pointer-events: none;
+    }
+    @keyframes slideDown {
+      from { opacity: 0; transform: translateX(-50%) translateY(-10px); }
+      to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+    }
+    .pikon-from { color: #a0a0ff; font-weight: 700; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>🎙 agent-hub voice</h1>
+
+  <!-- ========== Auth Panel ========== -->
+  <div id="authPanel">
+    <p class="hint">
+      operator が <code>@voice</code> に <code>/generate-code</code> を送り、<br>
+      届いた 6 桁コードを入力してください。
+    </p>
+    <input
+      class="otp-input"
+      id="otpInput"
+      type="text"
+      inputmode="numeric"
+      pattern="[0-9]*"
+      maxlength="6"
+      placeholder="000000"
+      autocomplete="one-time-code"
+      spellcheck="false"
+    >
+    <button class="btn btn-primary" id="connectBtn" disabled>接続</button>
+  </div>
+
+  <!-- ========== Voice Panel ========== -->
+  <div id="voicePanel">
+    <div class="status-badge" id="statusBadge">接続中...</div>
+    <div class="mic-btn-wrap">
+      <div class="mic-btn" id="micBtn">🎙</div>
+    </div>
+    <div class="transcript" id="transcript"></div>
+    <button class="btn btn-danger disconnect-btn" id="disconnectBtn">切断</button>
+  </div>
+</div>
+
+<script src="/voice.js"></script>
+<script>
+  // ---- DOM refs ----
+  const otpInput     = document.getElementById('otpInput');
+  const connectBtn   = document.getElementById('connectBtn');
+  const authPanel    = document.getElementById('authPanel');
+  const voicePanel   = document.getElementById('voicePanel');
+  const statusBadge  = document.getElementById('statusBadge');
+  const micBtn       = document.getElementById('micBtn');
+  const transcriptEl = document.getElementById('transcript');
+  const disconnectBtn = document.getElementById('disconnectBtn');
+
+  let client = null;
+
+  // ---- Auth panel ----
+
+  otpInput.addEventListener('input', () => {
+    connectBtn.disabled = otpInput.value.replace(/\D/g, '').length !== 6;
+  });
+
+  otpInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !connectBtn.disabled) connectBtn.click();
+  });
+
+  connectBtn.addEventListener('click', async () => {
+    const code = otpInput.value.replace(/\D/g, '');
+    if (code.length !== 6) return;
+
+    connectBtn.disabled = true;
+    client = new VoiceGatewayClient();
+
+    client.onStatusChange((s) => {
+      updateStatus(s);
+    });
+
+    client.onTranscript((speaker, text) => {
+      addTranscript(speaker, text);
+    });
+
+    client.onPikon((from, preview) => {
+      showPikonBanner(from, preview);
+    });
+
+    try {
+      await client.connect(code);
+    } catch (e) {
+      alert('接続失敗: ' + e.message);
+      connectBtn.disabled = false;
+    }
+  });
+
+  // ---- Voice panel ----
+
+  disconnectBtn.addEventListener('click', () => {
+    if (client) client.disconnect();
+  });
+
+  // ---- Status management ----
+
+  function updateStatus(s) {
+    statusBadge.textContent = s;
+    statusBadge.className = 'status-badge';
+
+    if (s === 'listening') {
+      // 認証完了 → voice panel に切り替え
+      authPanel.style.display = 'none';
+      voicePanel.style.display = 'block';
+      micBtn.classList.add('listening');
+      statusBadge.classList.add('listening');
+    } else if (s === 'auth_ok' || s === 'ready') {
+      authPanel.style.display = 'none';
+      voicePanel.style.display = 'block';
+      statusBadge.classList.add('ready');
+    } else if (s === 'disconnected' || s.startsWith('error')) {
+      // 切断 / エラー → auth panel に戻る
+      authPanel.style.display = 'block';
+      voicePanel.style.display = 'none';
+      micBtn.classList.remove('listening');
+      connectBtn.disabled = false;
+      otpInput.value = '';
+      client = null;
+    }
+  }
+
+  // ---- Transcript ----
+
+  function addTranscript(speaker, text) {
+    const p = document.createElement('p');
+    p.className = speaker;
+    p.textContent = (speaker === 'user' ? '👤 ' : '🤖 ') + text;
+    transcriptEl.appendChild(p);
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  }
+
+  // ---- pikon! banner ----
+
+  function showPikonBanner(from, preview) {
+    const banner = document.createElement('div');
+    banner.className = 'pikon-banner';
+    const safeFrom = String(from).replace(/</g, '&lt;');
+    const safePreview = String(preview).replace(/</g, '&lt;');
+    banner.innerHTML = `<span class="pikon-from">${safeFrom}</span>: ${safePreview}`;
+    document.body.appendChild(banner);
+    setTimeout(() => {
+      banner.style.opacity = '0';
+      banner.style.transition = 'opacity 0.3s';
+      setTimeout(() => banner.remove(), 300);
+    }, 3700);
+  }
+</script>
+</body>
+</html>
