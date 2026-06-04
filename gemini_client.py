@@ -26,7 +26,7 @@ class GeminiLiveClient:
     ) -> None:
         self.client = genai.Client(
             api_key=api_key,
-            http_options={"api_version": "v1alpha"},
+            http_options={"api_version": "v1beta"},
         )
         self.model = model
         self.config = types.LiveConnectConfig(
