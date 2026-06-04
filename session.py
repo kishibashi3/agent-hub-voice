@@ -280,17 +280,26 @@ class VoiceSession:
                                 return  # WS closed
 
                 # トランスクリプト
+                # NOTE: ADK バージョンによって transcription フィールドが
+                #       str または .text 属性を持つオブジェクトになる場合がある。
+                #       runtime で正規化して送信する。
                 if event.input_transcription:
+                    text = event.input_transcription
+                    if hasattr(text, "text"):
+                        text = text.text
                     await self._send_json({
                         "type": "transcript",
                         "speaker": "user",
-                        "text": event.input_transcription,
+                        "text": str(text),
                     })
                 if event.output_transcription:
+                    text = event.output_transcription
+                    if hasattr(text, "text"):
+                        text = text.text
                     await self._send_json({
                         "type": "transcript",
                         "speaker": "model",
-                        "text": event.output_transcription,
+                        "text": str(text),
                     })
 
                 # ターン完了: pending メッセージを Gemini context に注入
@@ -300,6 +309,7 @@ class VoiceSession:
 
         except Exception as e:
             logger.error("Gemini recv loop error: %s", e)
+            await self._send_error("gemini_error", str(e))
 
     # =========================================================================
     # pikon! 通知
@@ -357,6 +367,10 @@ class VoiceSession:
         context_text = "\n".join(lines)
 
         try:
+            # NOTE: send_content() はモデルに即時応答を促す挙動になる場合がある。
+            # 注入は常に turn_complete 直後 (ユーザーが発話していないタイミング) に
+            # 行うことで、発話中に割り込まない設計にしている。
+            # ただしモデルが即座に音声で返答するかは実装依存。
             queue.send_content(
                 content=types.Content(
                     role="user",

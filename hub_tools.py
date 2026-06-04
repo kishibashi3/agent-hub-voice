@@ -111,6 +111,8 @@ async def get_history(
             args["with_participant"] = with_participant
         if keyword:
             args["keyword"] = keyword
+        # TODO: hub SDK が get_history を直接メソッドとして expose したら
+        #       hub._call_tool_raw() を置き換える (内部 API 依存のため)
         text = await hub._call_tool_raw("get_history", args)
         return {"result": text, "success": True}
     except Exception as e:

@@ -53,8 +53,18 @@ def create_voice_runner(
     Returns:
         (runner, session_service) のタプル
     """
-    if api_key:
-        os.environ["GOOGLE_API_KEY"] = api_key
+    # Fail-fast: API キー未設定は起動時に検出する (ecosystem 方針 #1)。
+    # api_key="" (空文字列) は未設定と同義。接続後の認証エラーを防ぐ。
+    if not api_key:
+        raise ValueError(
+            "GEMINI_API_KEY must be set. "
+            "Set the GEMINI_API_KEY environment variable."
+        )
+    # GOOGLE_API_KEY を env に設定する。
+    # NOTE: 環境変数はプロセス全体に影響する global mutation だが、
+    #       voice-gateway は single-session のため複数 Runner が
+    #       異なる API キーで並走することはない。
+    os.environ["GOOGLE_API_KEY"] = api_key
 
     agent = Agent(
         name="voice_gateway",
