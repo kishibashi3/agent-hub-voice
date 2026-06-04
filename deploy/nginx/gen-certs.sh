@@ -54,8 +54,9 @@ echo "  出力先   : ${CERT_DIR}"
 echo "============================================"
 echo ""
 
-# 出力ディレクトリを作成
+# 出力ディレクトリを作成 (chmod 700 で一時的な world-readable ウィンドウを排除)
 sudo mkdir -p "${CERT_DIR}"
+sudo chmod 700 "${CERT_DIR}"
 
 # --------------------------------------------------------------------------
 # OpenSSL 設定ファイルを一時作成 (SAN を含む)
@@ -78,8 +79,11 @@ CN = ${HOSTNAME}
 [v3_req]
 subjectKeyIdentifier   = hash
 authorityKeyIdentifier = keyid,issuer
-basicConstraints       = critical, CA:TRUE
-keyUsage               = critical, digitalSignature, keyCertSign, cRLSign
+# CA:FALSE — TLS サーバー証明書として生成 (CA 証明書ではない)
+# CA:TRUE にすると秘密鍵漏洩時に任意ドメインの証明書偽造が可能になるため不可
+# iOS への自己署名証明書インストールは CA:FALSE でも同様に機能する
+basicConstraints       = critical, CA:FALSE
+keyUsage               = critical, digitalSignature, keyEncipherment
 extendedKeyUsage       = serverAuth
 subjectAltName         = @alt_names
 

@@ -2,12 +2,13 @@
 # setup.sh — Pi5 nginx HTTPS プロキシ ワンショットセットアップ
 #
 # 実行すること:
-#   1. nginx がインストール済みか確認 (未インストールならガイドを表示)
+#   1. nginx / openssl がインストール済みか確認 (未インストールならガイドを表示)
 #   2. 自己署名証明書を生成 (gen-certs.sh を呼び出す)
-#   3. nginx 設定ファイルを sites-available に配置
-#   4. sites-enabled にシンボリックリンクを作成
-#   5. default 設定が 443 と競合する場合は無効化
-#   6. nginx の設定を検証して reload
+#   3. websocket_map.conf を /etc/nginx/conf.d/ に配置
+#   4. nginx 設定ファイルを sites-available に配置
+#   5. sites-enabled にシンボリックリンクを作成
+#   6. port 443/8443 と競合する既存設定を全走査して無効化
+#   7. nginx の設定を検証して reload
 #
 # Usage:
 #   bash deploy/nginx/setup.sh [hostname]
@@ -76,7 +77,16 @@ else
 fi
 
 # --------------------------------------------------------------------------
-# Step 2: nginx 設定ファイルの配置
+# Step 2: WebSocket map を conf.d に配置
+# --------------------------------------------------------------------------
+_step "WebSocket upgrade map を配置"
+
+CONFD="/etc/nginx/conf.d"
+sudo cp "${SCRIPT_DIR}/websocket_map.conf" "${CONFD}/websocket_map.conf"
+_info "WebSocket map を配置: ${CONFD}/websocket_map.conf"
+
+# --------------------------------------------------------------------------
+# Step 3: nginx 設定ファイルの配置
 # --------------------------------------------------------------------------
 _step "nginx 設定ファイルを配置"
 
@@ -92,27 +102,36 @@ sudo ln -sf "${SITES_AVAILABLE}/${CONF_NAME}" "${SITES_ENABLED}/${CONF_NAME}"
 _info "シンボリックリンクを作成: ${SITES_ENABLED}/${CONF_NAME}"
 
 # --------------------------------------------------------------------------
-# Step 3: default 設定の競合チェック
+# Step 4: port 443/8443 競合チェック
+# シンボリックリンク環境でも実ファイルを参照して全設定を走査する
 # --------------------------------------------------------------------------
 _step "競合チェック"
 
-DEFAULT_ENABLED="${SITES_ENABLED}/default"
-if [[ -f "${DEFAULT_ENABLED}" ]] || [[ -L "${DEFAULT_ENABLED}" ]]; then
-    # default が 443 を listen しているか確認
-    DEFAULT_CONF="${SITES_AVAILABLE}/default"
-    if [[ -f "${DEFAULT_CONF}" ]] && grep -q "listen 443" "${DEFAULT_CONF}" 2>/dev/null; then
-        _warn "default 設定が port 443 を使用しています。無効化します。"
-        sudo rm -f "${DEFAULT_ENABLED}"
-        _info "default を sites-enabled から削除しました。"
-    else
-        _info "default 設定との競合なし (port 443 未使用)。"
+conflict_found=false
+for enabled_conf in "${SITES_ENABLED}"/*; do
+    # 今設置した自分の設定はスキップ
+    [[ "$(basename "${enabled_conf}")" == "${CONF_NAME}" ]] && continue
+    # 存在しないエントリをスキップ (glob が空の場合)
+    [[ -e "${enabled_conf}" ]] || continue
+
+    # シンボリックリンクの場合は実体ファイルの内容を確認
+    real_conf=$(realpath "${enabled_conf}" 2>/dev/null || echo "${enabled_conf}")
+
+    if grep -qE "listen[[:space:]]+((\[::]:)?(443|8443)|443[[:space:]]|8443[[:space:]])" \
+            "${real_conf}" 2>/dev/null; then
+        _warn "port 443/8443 と競合する設定を無効化します: ${enabled_conf}"
+        sudo rm -f "${enabled_conf}"
+        _info "削除: ${enabled_conf}"
+        conflict_found=true
     fi
-else
-    _info "default 設定は sites-enabled に存在しません。"
+done
+
+if [[ "${conflict_found}" == "false" ]]; then
+    _info "競合する設定なし。"
 fi
 
 # --------------------------------------------------------------------------
-# Step 4: nginx 設定検証 + reload
+# Step 5: nginx 設定検証 + reload
 # --------------------------------------------------------------------------
 _step "nginx 設定を検証して reload"
 
