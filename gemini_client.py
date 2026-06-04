@@ -1,58 +1,75 @@
 """
-Gemini Live API クライアントラッパー。
-google-genai SDK の BidiGenerateContent セッションを管理する。
+ADK Runner ファクトリ。
+
+google-adk SDK の Agent + Runner + InMemorySessionService を
+Gemini Live Audio セッション用に構成する。
+
+旧 GeminiLiveClient (google-genai 直接接続) の代替。
+Runner.run_live() + LiveRequestQueue パターンを使用する。
 """
 import logging
+import os
+import ssl
 
-from google import genai
-from google.genai import types
+from google.adk.agents import Agent
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+
+from hub_tools import VOICE_HUB_TOOLS
 
 logger = logging.getLogger(__name__)
 
+APP_NAME = "voice-gateway"
 
-class GeminiLiveClient:
+# Gemini API (非 Vertex AI) 使用時は ALPN を HTTP/1.1 に制限する。
+# デフォルトの SSL コンテキストは h2 をネゴシエートするが、
+# HTTP/2 では WebSocket Upgrade が使えないため Live API 接続がタイムアウトする。
+# cooking-agent (server/app.py) と同様のパッチを適用する。
+if not os.environ.get("GOOGLE_GENAI_USE_VERTEXAI"):
+    _orig_create_default_context = ssl.create_default_context
+
+    def _patched_create_default_context(*args, **kwargs):  # type: ignore[no-untyped-def]
+        ctx = _orig_create_default_context(*args, **kwargs)
+        ctx.set_alpn_protocols(["http/1.1"])
+        return ctx
+
+    ssl.create_default_context = _patched_create_default_context
+    logger.info("SSL ALPN patched to HTTP/1.1 (non-Vertex AI mode)")
+
+
+def create_voice_runner(
+    api_key: str,
+    model: str,
+    system_prompt: str,
+) -> tuple[Runner, InMemorySessionService]:
     """
-    Gemini Live WebSocket セッションのラッパー。
-    audio input/output + function calling を担当する。
+    Gemini Live 音声セッション用の ADK Runner を構成して返す。
+
+    Args:
+        api_key: Gemini API キー (GOOGLE_API_KEY env var にも設定する)
+        model:   Gemini モデル名 (e.g. "gemini-3.1-flash-live-preview")
+        system_prompt: システムプロンプト (Agent.instruction に渡す)
+
+    Returns:
+        (runner, session_service) のタプル
     """
+    if api_key:
+        os.environ["GOOGLE_API_KEY"] = api_key
 
-    def __init__(
-        self,
-        api_key: str,
-        model: str,
-        tools: list[types.Tool],
-        system_prompt: str,
-        voice_name: str = "Kore",
-    ) -> None:
-        self.client = genai.Client(
-            api_key=api_key,
-            http_options={"api_version": "v1beta"},
-        )
-        self.model = model
-        self.config = types.LiveConnectConfig(
-            response_modalities=["AUDIO"],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name=voice_name
-                    )
-                )
-            ),
-            tools=tools,
-            system_instruction=types.Content(
-                parts=[types.Part(text=system_prompt)]
-            ),
-        )
-        logger.debug("GeminiLiveClient initialized (model=%s, voice=%s)", model, voice_name)
+    agent = Agent(
+        name="voice_gateway",
+        model=model,
+        instruction=system_prompt,
+        tools=VOICE_HUB_TOOLS,
+    )
 
-    def connect(self):
-        """
-        Gemini Live セッションに接続する。
-        async context manager として使用:
+    session_service = InMemorySessionService()
 
-            async with client.connect() as session:
-                await session.send(...)
-                async for message in session.receive():
-                    ...
-        """
-        return self.client.aio.live.connect(model=self.model, config=self.config)
+    runner = Runner(
+        agent=agent,
+        app_name=APP_NAME,
+        session_service=session_service,
+    )
+
+    logger.info("ADK Runner initialized (model=%s)", model)
+    return runner, session_service
