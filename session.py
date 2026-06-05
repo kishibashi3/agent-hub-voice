@@ -75,6 +75,14 @@ class VoiceSession:
         self._queue: LiveRequestQueue | None = None
         self._hub = None  # session 中の hub 参照 (_on_pikon での直接返答用)
 
+        # ADK は partial (ストリーミング中チャンク) と non-partial (最終完全テキスト)
+        # 両方の transcription event を yield する。non-partial は partial の集積と
+        # 同じテキストを含むため、両方を送信すると browser で2重表示になる。
+        # partial が送信済みなら non-partial をスキップするためのフラグ。
+        # turn_complete でリセットする。
+        self._user_transcript_partial_sent = False
+        self._model_transcript_partial_sent = False
+
     # =========================================================================
     # メインエントリ
     # =========================================================================
@@ -284,6 +292,11 @@ class VoiceSession:
                                 return  # WS closed
 
                 # トランスクリプト
+                # ADK は partial (streaming chunk) と non-partial (最終完全テキスト)
+                # 両方の transcription event を yield する。
+                # partial を送信済みの場合は non-partial をスキップして browser での
+                # 2重表示を防ぐ。partial が未送信 (ASR が最終結果のみ返すケース) は
+                # non-partial を送信する。
                 # NOTE: ADK バージョンによって transcription フィールドが
                 #       str または .text 属性を持つオブジェクトになる場合がある。
                 #       runtime で正規化して送信する。
@@ -291,24 +304,51 @@ class VoiceSession:
                     text = event.input_transcription
                     if hasattr(text, "text"):
                         text = text.text
-                    await self._send_json({
-                        "type": "transcript",
-                        "speaker": "user",
-                        "text": str(text),
-                    })
+                    text_str = str(text)
+                    if text_str:
+                        if event.partial is True:
+                            self._user_transcript_partial_sent = True
+                            await self._send_json({
+                                "type": "transcript",
+                                "speaker": "user",
+                                "text": text_str,
+                            })
+                        elif not self._user_transcript_partial_sent:
+                            # partial 未送信: non-partial (最終結果) を送信
+                            await self._send_json({
+                                "type": "transcript",
+                                "speaker": "user",
+                                "text": text_str,
+                            })
+                        # else: partial 送信済み → non-partial は集積テキストの重複のためスキップ
+
                 if event.output_transcription:
                     text = event.output_transcription
                     if hasattr(text, "text"):
                         text = text.text
-                    await self._send_json({
-                        "type": "transcript",
-                        "speaker": "model",
-                        "text": str(text),
-                    })
+                    text_str = str(text)
+                    if text_str:
+                        if event.partial is True:
+                            self._model_transcript_partial_sent = True
+                            await self._send_json({
+                                "type": "transcript",
+                                "speaker": "model",
+                                "text": text_str,
+                            })
+                        elif not self._model_transcript_partial_sent:
+                            # partial 未送信: non-partial (最終結果) を送信
+                            await self._send_json({
+                                "type": "transcript",
+                                "speaker": "model",
+                                "text": text_str,
+                            })
+                        # else: partial 送信済み → non-partial は集積テキストの重複のためスキップ
 
-                # ターン完了: browser に通知してから pending メッセージを Gemini context に注入
+                # ターン完了: フラグリセット → browser 通知 → pending メッセージ注入
                 if event.turn_complete:
                     self.is_gemini_speaking = False
+                    self._model_transcript_partial_sent = False
+                    self._user_transcript_partial_sent = False
                     await self._send_json({"type": "turn_complete"})
                     await self._inject_pending_messages()
 
