@@ -142,6 +142,13 @@ class VoiceSession:
                     )
                 )
             ),
+            # Gemini の server-side VAD がユーザー発話を検知したら
+            # 即座にモデルを停止 (デフォルト動作だが明示的に設定)。
+            # これにより AI 発話中にユーザーが話し始めると Gemini 側で
+            # インタラプトが発生し event.interrupted=True イベントが届く。
+            realtime_input_config=types.RealtimeInputConfig(
+                activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+            ),
         )
 
         await self._send_json({"type": "session_ready"})
@@ -249,16 +256,15 @@ class VoiceSession:
     def _send_audio_to_queue(self, pcm: bytes) -> None:
         """PCM 音声データを LiveRequestQueue に送信する (同期)。
 
-        AI 発話中 (is_gemini_speaking=True / turn_complete 待ち) はスキップする。
-        ブラウザで再生された AI 音声がマイクに回り込み Gemini の VAD が誤検知する
-        echo フィードバックループを断ち切るため。
-        turn_complete または interrupted 受信後に自動的に再開する。
+        AI 発話中も含めて常に送信する。
+        Gemini の server-side VAD (activity_handling=START_OF_ACTIVITY_INTERRUPTS)
+        がユーザー音声を検知したタイミングで自律的にモデルを停止させる。
+        ミュートによるゲートは廃止: ミュートするとユーザー発話が Gemini に届かず
+        VAD が発火しないため、AI が止まらなくなる。
         """
         queue = self._queue
         if queue is None:
             return
-        if self.is_gemini_speaking:
-            return  # AI 発話中はミュート (echo フィードバック防止)
         try:
             queue.send_realtime(
                 blob=types.Blob(data=pcm, mime_type="audio/pcm;rate=16000")
@@ -269,9 +275,11 @@ class VoiceSession:
     async def _handle_control(self, msg: dict) -> None:
         t = msg.get("type")
         if t == "interrupt":
-            # 手動インタラプト (UI ボタン等): ミュートを解除し activity_start で停止要求
+            # 手動インタラプト (UI ボタン等): activity_start で AI を停止要求。
+            # 通常は Gemini VAD による自律インタラプトで十分だが、
+            # 明示的な停止要求として activity_start を送る。
             logger.info("Interrupt requested by browser")
-            self.is_gemini_speaking = False  # ミュート解除 → 次の音声から送信再開
+            self.is_gemini_speaking = False  # pikon pending メッセージを即注入させる
             queue = self._queue
             if queue:
                 try:
