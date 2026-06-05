@@ -82,9 +82,6 @@ class VoiceSession:
         # turn_complete / interrupted でリセットする。
         self._user_transcript_partial_sent = False
         self._model_transcript_partial_sent = False
-        # ユーザーが AI 発話中に話し始めた (= インタラプト開始) かを追跡するフラグ。
-        # True の間は重複 activity_start を送らない。turn_complete / interrupted でリセット。
-        self._user_speaking = False
 
     # =========================================================================
     # メインエントリ
@@ -252,20 +249,17 @@ class VoiceSession:
     def _send_audio_to_queue(self, pcm: bytes) -> None:
         """PCM 音声データを LiveRequestQueue に送信する (同期)。
 
-        AI 発話中に最初の音声チャンクが届いた場合は activity_start を先送りする。
-        activity_start は Gemini Live にユーザーが話し始めたことを通知し、
-        モデルの現在のターンをインタラプトさせる。
-        重複送信は _user_speaking フラグで防ぐ。
+        AI 発話中 (is_gemini_speaking=True / turn_complete 待ち) はスキップする。
+        ブラウザで再生された AI 音声がマイクに回り込み Gemini の VAD が誤検知する
+        echo フィードバックループを断ち切るため。
+        turn_complete または interrupted 受信後に自動的に再開する。
         """
         queue = self._queue
         if queue is None:
             return
+        if self.is_gemini_speaking:
+            return  # AI 発話中はミュート (echo フィードバック防止)
         try:
-            if self.is_gemini_speaking and not self._user_speaking:
-                # AI 発話中に初めて音声が来た → activity_start でインタラプト発行
-                self._user_speaking = True
-                queue.send_activity_start()
-                logger.info("activity_start sent: user interrupted model speech")
             queue.send_realtime(
                 blob=types.Blob(data=pcm, mime_type="audio/pcm;rate=16000")
             )
@@ -275,13 +269,12 @@ class VoiceSession:
     async def _handle_control(self, msg: dict) -> None:
         t = msg.get("type")
         if t == "interrupt":
-            # ブラウザから明示的インタラプト要求: activity_start で Gemini に通知
+            # 手動インタラプト (UI ボタン等): ミュートを解除し activity_start で停止要求
             logger.info("Interrupt requested by browser")
-            self.is_gemini_speaking = False
+            self.is_gemini_speaking = False  # ミュート解除 → 次の音声から送信再開
             queue = self._queue
-            if queue and not self._user_speaking:
+            if queue:
                 try:
-                    self._user_speaking = True
                     queue.send_activity_start()
                     logger.info("activity_start sent via explicit browser interrupt")
                 except Exception as e:
@@ -306,10 +299,9 @@ class VoiceSession:
                 # ブラウザ側で _playbackQueue をフラッシュして再生を即止める。
                 if event.interrupted:
                     self.is_gemini_speaking = False
-                    self._user_speaking = False
                     self._model_transcript_partial_sent = False
                     await self._send_json({"type": "interrupted"})
-                    logger.info("Model interrupted by user — sent interrupted to browser")
+                    logger.info("Model interrupted — sent interrupted to browser")
 
                 # 音声コンテンツをブラウザに転送
                 if event.content and event.content.parts:
@@ -379,7 +371,6 @@ class VoiceSession:
                     self.is_gemini_speaking = False
                     self._model_transcript_partial_sent = False
                     self._user_transcript_partial_sent = False
-                    self._user_speaking = False
                     await self._send_json({"type": "turn_complete"})
                     await self._inject_pending_messages()
 
