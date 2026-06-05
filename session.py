@@ -323,37 +323,63 @@ class VoiceSession:
     async def _on_pikon(self, messages: list[IncomingMessage]) -> None:
         """SDK inbox() による新メッセージ到着通知。
 
-        /generate-code はセッション接続中であることを sender に通知し、
-        Gemini (ADK セッション) には転送しない。
-        CommandListener が同じメッセージを受け取った場合でも、
-        セッション接続中はこちらが最優先で応答する。
+        /generate-code はセッション接続中でも最優先で処理する:
+          1. OTP を生成して sender に返信（CommandListener と同じ形式）
+          2. ブラウザに session_terminated を通知してから WS を閉じる
+          3. WS 閉鎖 → upstream_task 終了 → _main_loop クリーンアップ
+
+        /generate-code を送った = 新しい接続を取りに行く意思があるため、
+        既存セッションを拒否するのではなく切断して制御を渡す設計。
+        通常メッセージは Gemini (ADK セッション) に転送する。
         """
         if not messages:
             return
 
         # /generate-code を Gemini に転送せず直接処理する
         forwarded: list[IncomingMessage] = []
+        disconnect_requested = False
         for msg in messages:
             body = (msg.body or "").strip()
             if body.lower() == CMD_GENERATE_CODE:
-                # セッション接続中: 切断を促す返答を送信して ack
+                # セッション接続中: OTP を発行して既存セッションを切断する。
+                # /generate-code を発行した = 新しい接続を取りに行く意思があるため、
+                # 拒否するのではなく既存セッションを切断して制御を渡す。
                 try:
                     if self._hub is not None:
-                        await self._hub.send(
-                            msg.sender,
-                            "⚠️ セッション接続中です。切断してから再試行してください。",
+                        code, ttl = self.otp_store.generate()
+                        ttl_min = ttl // 60
+                        reply = (
+                            f"🔑 **{code}** ({ttl_min}分有効)\n\n"
+                            "スマホブラウザでこのコードを入力してセッションを開始してください。"
                         )
+                        await self._hub.send(msg.sender, reply)
                         await self._hub.ack(msg.id)
                         logger.info(
-                            "/generate-code intercepted during session (sender=%s)",
+                            "/generate-code during session: OTP sent to %s (code=%s****), disconnecting",
                             msg.sender,
+                            code[:2],
                         )
+                        disconnect_requested = True
                 except Exception as e:
                     logger.error(
                         "Failed to handle /generate-code during session: %s", e
                     )
             else:
                 forwarded.append(msg)
+
+        if disconnect_requested:
+            # ブラウザに切断通知を送ってから WS を閉じる。
+            # WS が閉じると upstream_task が終了し、_main_loop のクリーンアップが走る。
+            await self._send_json({
+                "type": "session_terminated",
+                "reason": "new_session_requested",
+            })
+            await asyncio.sleep(0.1)
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+            return
 
         if not forwarded:
             return
