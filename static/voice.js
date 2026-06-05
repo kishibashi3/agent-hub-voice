@@ -31,16 +31,18 @@ class VoiceGatewayClient {
     this._playbackQueue = Promise.resolve();
 
     // コールバック
-    this._onStatusChange = null; // (status: string) => void
-    this._onTranscript = null;   // (speaker: 'user'|'model', text: string) => void
-    this._onPikon = null;        // (from: string, preview: string) => void
+    this._onStatusChange = null;  // (status: string) => void
+    this._onTranscript = null;    // (speaker: 'user'|'model', text: string) => void
+    this._onTurnComplete = null;  // () => void
+    this._onPikon = null;         // (from: string, preview: string) => void
   }
 
   // ---- public API ----------------------------------------------------------
 
-  onStatusChange(fn) { this._onStatusChange = fn; }
-  onTranscript(fn)   { this._onTranscript = fn; }
-  onPikon(fn)        { this._onPikon = fn; }
+  onStatusChange(fn)  { this._onStatusChange = fn; }
+  onTranscript(fn)    { this._onTranscript = fn; }
+  onTurnComplete(fn)  { this._onTurnComplete = fn; }
+  onPikon(fn)         { this._onPikon = fn; }
 
   /**
    * OTP コードを指定して gateway に接続する。
@@ -123,6 +125,10 @@ class VoiceGatewayClient {
 
       case 'transcript':
         if (this._onTranscript) this._onTranscript(msg.speaker, msg.text);
+        break;
+
+      case 'turn_complete':
+        if (this._onTurnComplete) this._onTurnComplete();
         break;
 
       case 'error':

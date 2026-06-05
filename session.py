@@ -302,9 +302,10 @@ class VoiceSession:
                         "text": str(text),
                     })
 
-                # ターン完了: pending メッセージを Gemini context に注入
+                # ターン完了: browser に通知してから pending メッセージを Gemini context に注入
                 if event.turn_complete:
                     self.is_gemini_speaking = False
+                    await self._send_json({"type": "turn_complete"})
                     await self._inject_pending_messages()
 
         except Exception as e:
