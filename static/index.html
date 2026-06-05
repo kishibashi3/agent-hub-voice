@@ -220,6 +220,10 @@
 
   let client = null;
 
+  // Transcript streaming state: current <p> per speaker within a turn.
+  // Reset to null on turn_complete so the next chunk starts a new line.
+  let _transcriptCurrentEl = { user: null, model: null };
+
   // ---- Auth panel ----
 
   otpInput.addEventListener('input', () => {
@@ -244,6 +248,8 @@
     client.onTranscript((speaker, text) => {
       addTranscript(speaker, text);
     });
+
+    client.onTurnComplete(handleTurnComplete);
 
     client.onPikon((from, preview) => {
       showPikonBanner(from, preview);
@@ -288,6 +294,7 @@
       micBtn.classList.remove('listening');
       connectBtn.disabled = false;
       otpInput.value = '';
+      _transcriptCurrentEl = { user: null, model: null };
       client = null;
       showErrorBanner('セッション使用中', '別のデバイスで既にセッションが開いています。そちらを切断してから再接続してください。');
     } else if (s === 'disconnected' || s.startsWith('error')) {
@@ -298,6 +305,7 @@
       micBtn.classList.remove('listening');
       connectBtn.disabled = false;
       otpInput.value = '';
+      _transcriptCurrentEl = { user: null, model: null };
       client = null;
     } else {
       statusBadge.textContent = s;
@@ -306,12 +314,26 @@
 
   // ---- Transcript ----
 
+  /**
+   * 同一ターン内のチャンクは同じ <p> に追記して CUI ライクなストリーミング表示にする。
+   * ターン切り替わりは handleTurnComplete() が _transcriptCurrentEl をリセットする。
+   */
   function addTranscript(speaker, text) {
-    const p = document.createElement('p');
-    p.className = speaker;
-    p.textContent = (speaker === 'user' ? '👤 ' : '🤖 ') + text;
-    transcriptEl.appendChild(p);
-    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    if (speaker !== 'user' && speaker !== 'model') return;
+    if (!_transcriptCurrentEl[speaker]) {
+      const p = document.createElement('p');
+      p.className = speaker;
+      p.textContent = (speaker === 'user' ? '👤 ' : '🤖 ');
+      transcriptEl.appendChild(p);
+      _transcriptCurrentEl[speaker] = p;
+    }
+    _transcriptCurrentEl[speaker].textContent += text;
+    requestAnimationFrame(() => { transcriptEl.scrollTop = transcriptEl.scrollHeight; });
+  }
+
+  /** turn_complete 受信時: 次のチャンクから新しい行を開始する。 */
+  function handleTurnComplete() {
+    _transcriptCurrentEl = { user: null, model: null };
   }
 
   // ---- pikon! banner ----
