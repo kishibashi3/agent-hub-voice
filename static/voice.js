@@ -137,6 +137,10 @@ class VoiceGatewayClient {
         this._setStatus(msg.code === 'session_in_use' ? 'session_in_use' : 'error: ' + msg.code);
         this.disconnect();
         break;
+
+      default:
+        // 未知のメッセージタイプは無視
+        break;
     }
   }
 

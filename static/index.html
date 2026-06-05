@@ -249,9 +249,7 @@
       addTranscript(speaker, text);
     });
 
-    client.onTurnComplete(() => {
-      handleTurnComplete();
-    });
+    client.onTurnComplete(handleTurnComplete);
 
     client.onPikon((from, preview) => {
       showPikonBanner(from, preview);
@@ -321,6 +319,7 @@
    * ターン切り替わりは handleTurnComplete() が _transcriptCurrentEl をリセットする。
    */
   function addTranscript(speaker, text) {
+    if (speaker !== 'user' && speaker !== 'model') return;
     if (!_transcriptCurrentEl[speaker]) {
       const p = document.createElement('p');
       p.className = speaker;
@@ -329,7 +328,7 @@
       _transcriptCurrentEl[speaker] = p;
     }
     _transcriptCurrentEl[speaker].textContent += text;
-    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    requestAnimationFrame(() => { transcriptEl.scrollTop = transcriptEl.scrollHeight; });
   }
 
   /** turn_complete 受信時: 次のチャンクから新しい行を開始する。 */
