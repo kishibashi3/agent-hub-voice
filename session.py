@@ -25,6 +25,7 @@ from google.genai import types
 from agent_hub_sdk import AgentHub, IncomingMessage
 
 from auth import OTPStore
+from command_listener import CMD_GENERATE_CODE
 import hub_tools
 from gemini_client import APP_NAME, create_voice_runner
 from pikon import PikonListener
@@ -72,6 +73,7 @@ class VoiceSession:
         self._pending_messages: list[IncomingMessage] = []
         self._pikon_listener: PikonListener | None = None
         self._queue: LiveRequestQueue | None = None
+        self._hub = None  # session 中の hub 参照 (_on_pikon での直接返答用)
 
     # =========================================================================
     # メインエントリ
@@ -98,6 +100,7 @@ class VoiceSession:
     async def _run_with_hub(self, hub) -> None:
         """hub 接続中の処理。hub_tools モジュール変数を通じてツールに hub を渡す。"""
         hub_tools.set_hub_session(hub)
+        self._hub = hub  # /generate-code インターセプト用に保持
         self._pikon_listener = PikonListener(hub=hub, on_message=self._on_pikon)
 
         try:
@@ -107,6 +110,7 @@ class VoiceSession:
             await self._send_error("session_error", str(e))
         finally:
             hub_tools.clear_hub_session()
+            self._hub = None
             if self._pikon_listener:
                 self._pikon_listener.stop()
 
@@ -317,12 +321,45 @@ class VoiceSession:
     # =========================================================================
 
     async def _on_pikon(self, messages: list[IncomingMessage]) -> None:
-        """SDK inbox() による新メッセージ到着通知。"""
+        """SDK inbox() による新メッセージ到着通知。
+
+        /generate-code はセッション接続中であることを sender に通知し、
+        Gemini (ADK セッション) には転送しない。
+        CommandListener が同じメッセージを受け取った場合でも、
+        セッション接続中はこちらが最優先で応答する。
+        """
         if not messages:
             return
 
+        # /generate-code を Gemini に転送せず直接処理する
+        forwarded: list[IncomingMessage] = []
+        for msg in messages:
+            body = (msg.body or "").strip()
+            if body.lower() == CMD_GENERATE_CODE:
+                # セッション接続中: 切断を促す返答を送信して ack
+                try:
+                    if self._hub is not None:
+                        await self._hub.send(
+                            msg.sender,
+                            "⚠️ セッション接続中です。切断してから再試行してください。",
+                        )
+                        await self._hub.ack(msg.id)
+                        logger.info(
+                            "/generate-code intercepted during session (sender=%s)",
+                            msg.sender,
+                        )
+                except Exception as e:
+                    logger.error(
+                        "Failed to handle /generate-code during session: %s", e
+                    )
+            else:
+                forwarded.append(msg)
+
+        if not forwarded:
+            return
+
         # pikon! 通知を browser に送信
-        first = messages[0]
+        first = forwarded[0]
         preview = (first.body or "")[:50]
         await self._send_json({
             "type": "pikon",
@@ -332,9 +369,9 @@ class VoiceSession:
 
         # Gemini が発話中なら pending に積んで次の turnComplete を待つ
         if self.is_gemini_speaking:
-            self._pending_messages.extend(messages)
+            self._pending_messages.extend(forwarded)
         else:
-            await self._inject_messages_to_gemini(messages)
+            await self._inject_messages_to_gemini(forwarded)
 
     async def _inject_pending_messages(self) -> None:
         """turnComplete 時に pending メッセージを Gemini context に注入する。
