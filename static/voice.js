@@ -8,6 +8,15 @@
  *   4. AudioWorklet でリサンプリング (48kHz → 16kHz) → WS binary 送信
  *   5. WS binary (24kHz PCM) → AudioContext で再生
  *   6. pikon! / transcript / interrupted 制御メッセージ処理
+ *
+ * ## エコー抑制 (issue #12)
+ *
+ * AI 発話中 (_isAiSpeaking=true) は worklet に setMute(true) を送り、
+ * マイク入力をゼロ PCM に置き換えてエコーが Gemini VAD に届くのを防ぐ。
+ * worklet は RMS がしきい値を超えた場合に user_activity を通知し、
+ * ミュートを自動解除する。voice.js はそれを受けて interrupt を送信して
+ * AI を停止させる (自然な割り込みを維持)。
+ * turn_complete / interrupted 受信時はミュートを解除する。
  */
 
 'use strict';
@@ -33,6 +42,10 @@ class VoiceGatewayClient {
     // 再生世代カウンタ。インタラプト発生時にインクリメントし、
     // 古い世代のバッファを再生しないようにする。
     this._playbackGeneration = 0;
+
+    // AI 発話中フラグ (エコー抑制ゲーティング用)
+    // true の間は worklet にミュートを指示し、ゼロ PCM を送信させる。
+    this._isAiSpeaking = false;
 
     // コールバック
     this._onStatusChange = null;  // (status: string) => void
@@ -134,12 +147,15 @@ class VoiceGatewayClient {
         break;
 
       case 'turn_complete':
+        // AI 発話完了 → ミュート解除
+        this._setAiSpeaking(false);
         if (this._onTurnComplete) this._onTurnComplete();
         break;
 
       case 'interrupted':
-        // AI が発話中にユーザー音声を検知 → 再生キューを即時フラッシュ
+        // AI が発話中にユーザー音声を検知 → 再生キューを即時フラッシュ + ミュート解除
         this._flushPlayback();
+        this._setAiSpeaking(false);
         if (this._onInterrupted) this._onInterrupted();
         break;
 
@@ -166,9 +182,11 @@ class VoiceGatewayClient {
     await this.audioCtx.audioWorklet.addModule('/worklet.js');
 
     // マイク取得
+    // NOTE: sampleRate 制約を指定しない。明示的な sampleRate 指定は
+    //       ブラウザの AEC 参照信号収集を妨げる場合があるため、
+    //       AudioContext 側のリサンプリングに任せる (issue #12)。
     this.micStream = await navigator.mediaDevices.getUserMedia({
       audio: {
-        sampleRate: 48000,
         channelCount: 1,
         echoCancellation: true,
         noiseSuppression: true,
@@ -179,10 +197,16 @@ class VoiceGatewayClient {
     const source = this.audioCtx.createMediaStreamSource(this.micStream);
     this.workletNode = new AudioWorkletNode(this.audioCtx, 'resampler-16k');
 
-    // Worklet からリサンプル済み PCM を受け取って WS 送信
+    // Worklet からリサンプル済み PCM または制御メッセージを受け取る
     this.workletNode.port.onmessage = (e) => {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(e.data); // PCM 16kHz binary
+      if (e.data instanceof ArrayBuffer) {
+        // PCM データ → WS 送信
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(e.data); // PCM 16kHz binary
+        }
+      } else if (e.data?.type === 'user_activity') {
+        // ミュート中にユーザーが話し始めた → interrupt を送信して AI を停止
+        this._onUserActivity();
       }
     };
 
@@ -205,6 +229,32 @@ class VoiceGatewayClient {
     }
   }
 
+  // ---- private: エコー抑制 -----------------------------------------------
+
+  /**
+   * AI 発話状態フラグを更新し、worklet にミュート指示を送る。
+   * @param {boolean} value - true: AI 発話中 (ミュート ON), false: ミュート OFF
+   */
+  _setAiSpeaking(value) {
+    this._isAiSpeaking = value;
+    if (this.workletNode) {
+      this.workletNode.port.postMessage({ type: 'setMute', value });
+    }
+  }
+
+  /**
+   * worklet から user_activity 通知を受け取ったときの処理。
+   * AI 発話中にユーザーが話し始めたと判断し、interrupt を送信する。
+   */
+  _onUserActivity() {
+    if (!this._isAiSpeaking) return; // AI 発話中でなければ何もしない
+    this._isAiSpeaking = false;
+    console.log('[voice-gateway] user activity detected during AI speech — sending interrupt');
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: 'interrupt' }));
+    }
+  }
+
   // ---- private: 音声再生 --------------------------------------------------
 
   /**
@@ -221,6 +271,11 @@ class VoiceGatewayClient {
   }
 
   _playAudio(pcmBuffer) {
+    // AI 発話開始: worklet をミュートしてエコーを抑制
+    if (!this._isAiSpeaking) {
+      this._setAiSpeaking(true);
+    }
+
     // 現在の世代を捕捉してクロージャに閉じ込める
     const gen = this._playbackGeneration;
 

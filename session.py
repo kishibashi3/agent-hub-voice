@@ -306,11 +306,10 @@ class VoiceSession:
     def _send_audio_to_queue(self, pcm: bytes) -> None:
         """PCM 音声データを LiveRequestQueue に送信する (同期)。
 
-        AI 発話中も含めて常に送信する。
-        Gemini の server-side VAD (activity_handling=START_OF_ACTIVITY_INTERRUPTS)
-        がユーザー音声を検知したタイミングで自律的にモデルを停止させる。
-        ミュートによるゲートは廃止: ミュートするとユーザー発話が Gemini に届かず
-        VAD が発火しないため、AI が止まらなくなる。
+        ブラウザ側 (worklet.js) が AI 発話中はゼロ PCM を送信するエコー抑制
+        ゲーティングを実装しているため、サーバー側での音声ミュート処理は不要。
+        ユーザーが話し始めると worklet が RMS でそれを検知し、ミュート解除 +
+        {"type":"interrupt"} を送信することで AI を停止させる (issue #12)。
         """
         queue = self._queue
         if queue is None:
