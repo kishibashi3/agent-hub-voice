@@ -1,4 +1,6 @@
 """
+@deprecated: このリポジトリは非推奨です。voice2 (agent-hub-voice2) に移行してください。
+
 voice-gateway エントリポイント。
 
 aiohttp を使って以下を 1 ポートで提供:
