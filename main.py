@@ -22,8 +22,11 @@ from pathlib import Path
 
 from aiohttp import web
 
+from agent_hub_sdk import AgentHub
+
 from auth import OTPStore
-from command_listener import CommandListener
+from command_listener import CommandListener, DISPLAY_NAME
+import hub_tools
 from session import VoiceSession
 
 logging.basicConfig(
@@ -64,6 +67,13 @@ otp_store = OTPStore()
 # locked() チェックと acquire() の間に await がないため TOCTOU は発生しない。
 _session_lock = asyncio.Lock()
 
+# 共有 AgentHub セッション (_run_hub_with_reconnect が管理)
+_active_hub = None
+
+# アクティブな VoiceSession (None = 音声セッションなし)
+# asyncio は single-thread のため、単純な代入でスレッドセーフ。
+_active_session: VoiceSession | None = None
+
 
 # ---- HTTP / WS ハンドラ -------------------------------------------------
 
@@ -103,22 +113,35 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
 
     logger.info("WS connected: %s", request.remote)
     async with _session_lock:
+        hub = _active_hub
+        if hub is None:
+            logger.warning("WS rejected: hub not connected")
+            await ws.send_json({
+                "type": "error",
+                "code": "hub_unavailable",
+                "message": "agent-hub に接続中です。しばらくお待ちください。",
+            })
+            await asyncio.sleep(0.1)
+            await ws.close()
+            return ws
+
+        global _active_session
         session = VoiceSession(
             browser_ws=ws,
-            hub_url=AGENT_HUB_URL,
+            hub=hub,
             hub_user=AGENT_HUB_USER,
-            hub_pat=AGENT_HUB_GITHUB_PAT,
-            hub_tenant=AGENT_HUB_TENANT,
             gemini_api_key=GEMINI_API_KEY,
             gemini_model=GEMINI_MODEL,
             system_prompt=AGENT_HUB_VOICE_PERSONA,
             otp_store=otp_store,
         )
+        _active_session = session
         try:
             await session.run()
         except Exception:
             logger.exception("Session crashed")
         finally:
+            _active_session = None
             logger.info("WS disconnected: %s", request.remote)
 
     return ws
@@ -146,18 +169,68 @@ def build_app() -> web.Application:
     return app
 
 
+# ---- Hub 管理 -----------------------------------------------------------
+
+async def _run_hub_with_reconnect(cmd_listener: CommandListener) -> None:
+    """単一の AgentHub セッションを管理する。切断時は自動再接続。
+
+    inbox は 1 本だけ開き、メッセージを以下のルールで dispatch する:
+      - VoiceSession がアクティブ → VoiceSession._on_pikon() に転送
+      - VoiceSession なし → CommandListener.handle() で slash command 処理
+
+    これにより同一 @voice ハンドルで 2 本の MCP セッションが並走する問題を解消する。
+    """
+    global _active_hub
+    backoff = 5.0
+    while True:
+        try:
+            async with AgentHub.connect(
+                user=AGENT_HUB_USER,
+                url=AGENT_HUB_URL,
+                pat=AGENT_HUB_GITHUB_PAT,
+                tenant=AGENT_HUB_TENANT,
+                display_name=DISPLAY_NAME,
+            ) as hub:
+                _active_hub = hub
+                hub_tools.set_hub_session(hub)
+                # 音声セッションが再接続時にアクティブな場合は hub 参照を更新
+                if _active_session is not None:
+                    _active_session.update_hub(hub)
+                backoff = 5.0  # 正常接続できたらリセット
+                logger.info("Hub: @%s に接続しました", AGENT_HUB_USER)
+
+                async with hub.inbox() as messages:
+                    async for msg in messages:
+                        session = _active_session
+                        if session is not None:
+                            # 音声セッションがアクティブ: pikon として転送
+                            await session._on_pikon([msg])
+                        else:
+                            # 音声セッションなし: CommandListener が処理
+                            await cmd_listener.handle(hub, msg)
+
+        except asyncio.CancelledError:
+            logger.info("Hub: シャットダウン")
+            _active_hub = None
+            raise
+        except Exception as e:
+            logger.error("Hub: 切断 (%s) — %.1fs 後に再接続", e, backoff)
+            _active_hub = None
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
+
+
 # ---- エントリポイント ---------------------------------------------------
 
 async def main() -> None:
-    # CommandListener (OTP 発行 + agent-hub inbox listen) 起動
-    cmd_listener = CommandListener(
-        hub_url=AGENT_HUB_URL,
-        hub_user=AGENT_HUB_USER,
-        hub_pat=AGENT_HUB_GITHUB_PAT,
-        hub_tenant=AGENT_HUB_TENANT,
-        otp_store=otp_store,
+    # CommandListener (OTP 発行ハンドラ) を生成
+    # hub 接続は _run_hub_with_reconnect が管理するため、ここでは接続しない
+    cmd_listener = CommandListener(otp_store=otp_store)
+
+    # 単一 Hub セッション管理タスク (inbox dispatch も担当)
+    hub_task = asyncio.create_task(
+        _run_hub_with_reconnect(cmd_listener), name="hub_manager"
     )
-    cmd_task = asyncio.create_task(cmd_listener.run(), name="command_listener")
 
     # HTTP / WS サーバー起動
     app = build_app()
@@ -172,7 +245,7 @@ async def main() -> None:
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Shutting down...")
     finally:
-        cmd_task.cancel()
+        hub_task.cancel()
         await runner.cleanup()
 
 

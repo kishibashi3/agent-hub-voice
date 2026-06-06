@@ -4,26 +4,20 @@ VoiceSession — browser WebSocket ↔ Gemini Live 1:1 セッション (ADK ベ�
 ライフサイクル:
   1. OTP 認証 (auth.py)
   2. ADK セッション作成 (InMemorySessionService)
-  3. upstream / downstream / hub_manager を並行実行
+  3. upstream / downstream を並行実行
      - upstream: browser PCM → LiveRequestQueue.send_realtime()
      - downstream: Runner イベント → browser WS (audio bytes / transcript JSON)
-     - hub_manager: agent-hub SDK 接続 + PikonListener + 自動再接続ループ
-  4. hub_manager が hub_tools にセッションを注入 (再接続ごとに更新)
+  4. hub は main.py が管理する単一 AgentHub セッションを受け取る
+     (再接続時は main.py が update_hub() を呼んで参照を更新)
   5. 切断時クリーンアップ (hub_tools.clear_hub_session / queue.close)
 
-## hub 再接続設計 (issue: セッション切断問題)
+## hub 共有設計
 
-agent-hub サーバーは MCP セッションを 30 秒ごとに ping し、応答がなければ
-切断する (PING_MAX_RETRIES=2, PING_TIMEOUT_MS=5000)。ADK 音声 I/O と並行実行中、
-asyncio イベントループの競合で pong が 5 秒以内に届かず、サーバーが MCP セッションを
-切断するケースがある。
+main.py が AgentHub.connect() を 1 回だけ呼び、単一の MCP セッションを管理する。
+CommandListener と VoiceSession はその hub を共有し、inbox も 1 本のみ開く。
 
-修正前: MCP セッション切断 → pikon_task 失敗 → _main_loop 終了 → WS 切断
-修正後: MCP セッション切断 → hub_manager が自動再接続 → Gemini セッション継続
-
-hub_manager_loop は upstream / downstream の wait 対象に含めない。
-upstream (ブラウザ切断) か downstream (Gemini エラー) が終了したときのみ
-セッション全体を停止する。
+これにより同一 @voice ハンドルで 2 本の MCP セッションが並走する問題を解消し、
+active ping (30s 周期) への応答失敗による SSE 切断ループを防ぐ。
 """
 import asyncio
 import json
@@ -35,47 +29,41 @@ from google.adk.agents import LiveRequestQueue
 from google.adk.runners import RunConfig
 from google.genai import types
 
-from agent_hub_sdk import AgentHub, IncomingMessage
+from agent_hub_sdk import HubSession, IncomingMessage
 
 from auth import OTPStore
 from command_listener import CMD_GENERATE_CODE
 import hub_tools
 from gemini_client import APP_NAME, create_voice_runner
-from pikon import PikonListener
 
 logger = logging.getLogger(__name__)
 
 AUTH_TIMEOUT = 30  # 秒: OTP 入力待ちタイムアウト
 VOICE_NAME = "Kore"
 
-# hub 再接続バックオフ設定
-_HUB_RECONNECT_BACKOFF_MIN_S = 1.0
-_HUB_RECONNECT_BACKOFF_MAX_S = 30.0
-
 
 class VoiceSession:
     """
     1 ブラウザ接続 = 1 VoiceSession。
     aiohttp.web.WebSocketResponse を browser_ws として受け取る。
+
+    hub は main.py が管理する単一 AgentHub セッションを受け取る。
+    hub 再接続時は main.py が update_hub() を呼んで参照を更新する。
     """
 
     def __init__(
         self,
         browser_ws: web.WebSocketResponse,
-        hub_url: str,
+        hub: HubSession,
         hub_user: str,
-        hub_pat: str,
-        hub_tenant: str | None,
         gemini_api_key: str,
         gemini_model: str,
         system_prompt: str,
         otp_store: OTPStore,
     ) -> None:
         self.ws = browser_ws
-        self._hub_url = hub_url
+        self._hub: HubSession | None = hub
         self._hub_user = hub_user
-        self._hub_pat = hub_pat
-        self._hub_tenant = hub_tenant
         self.otp_store = otp_store
 
         # ADK Runner (セッションごとに生成)
@@ -88,9 +76,10 @@ class VoiceSession:
 
         self.is_gemini_speaking = False
         self._pending_messages: list[IncomingMessage] = []
-        self._pikon_listener: PikonListener | None = None
         self._queue: LiveRequestQueue | None = None
-        self._hub = None  # session 中の hub 参照 (_on_pikon での直接返答用)
+
+        # hub_tools に hub を登録 (Gemini function tools から参照される)
+        hub_tools.set_hub_session(hub)
 
         # ADK は partial (ストリーミング中チャンク) と non-partial (最終完全テキスト)
         # 両方の transcription event を yield する。non-partial は partial の集積と
@@ -109,7 +98,7 @@ class VoiceSession:
         if not await self._authenticate():
             return
 
-        # Step 2: Gemini セッション起動 (hub は内部で再接続ループ管理)
+        # Step 2: Gemini セッション起動 (hub は main.py が管理)
         try:
             await self._run_session()
         except Exception as e:
@@ -117,10 +106,9 @@ class VoiceSession:
             await self._send_error("session_error", str(e))
 
     async def _run_session(self) -> None:
-        """ADK セッションを作成し upstream / downstream / hub_manager を並行実行する。
+        """ADK セッションを作成し upstream / downstream を並行実行する。
 
-        hub_manager は MCP セッション切断時に自動再接続するため、
-        Gemini セッションは hub の状態に依存しない。
+        hub は main.py が管理する共有セッションを利用する。
         upstream (ブラウザ切断) か downstream (Gemini エラー) が終了したときのみ
         セッション全体を停止する。
         """
@@ -165,16 +153,15 @@ class VoiceSession:
                 self._queue.close()
                 self._queue = None
             self._adk_session_id = None
-            # hub_manager_loop の CancelledError 後に確実にクリア (二重呼び出し安全)
+            # Gemini ツールから hub への参照を解除 (二重呼び出し安全)
             hub_tools.clear_hub_session()
             self._hub = None
 
     async def _main_loop(self, run_config: RunConfig) -> None:
-        """upstream / downstream / hub_manager を並行実行。
+        """upstream / downstream を並行実行。
 
         upstream (ブラウザ切断) か downstream (Gemini エラー) が終了したら全停止。
-        hub_manager は自動再接続するため wait 対象に含めない — hub 切断だけでは
-        セッションを終了しない。
+        hub は main.py が管理するため、ここでは接続管理を行わない。
         """
         upstream_task = asyncio.create_task(
             self._browser_recv_loop(), name="upstream"
@@ -182,64 +169,26 @@ class VoiceSession:
         downstream_task = asyncio.create_task(
             self._gemini_recv_loop(run_config), name="downstream"
         )
-        hub_task = asyncio.create_task(
-            self._hub_manager_loop(), name="hub_manager"
-        )
 
         try:
             # upstream / downstream どちらかが完了 (= ブラウザ切断 / Gemini エラー)
-            # したら残りをキャンセル。hub_manager は対象外 (再接続ループのため)。
+            # したら残りをキャンセル。
             await asyncio.wait(
                 {upstream_task, downstream_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
         finally:
-            for t in [upstream_task, downstream_task, hub_task]:
+            for t in [upstream_task, downstream_task]:
                 t.cancel()
             await asyncio.gather(
-                upstream_task, downstream_task, hub_task, return_exceptions=True
+                upstream_task, downstream_task, return_exceptions=True
             )
 
-    async def _hub_manager_loop(self) -> None:
-        """agent-hub 接続を確立し、切断時に自動再接続する。
-
-        MCP セッションが server-side ping 失敗等で切断されても Gemini セッションを
-        継続させるための再接続ループ。再接続中は hub_tools が "hub not connected" を
-        返すが、音声会話自体は途切れない。
-
-        バックオフ: 初回 1s → 最大 30s (指数)。
-        """
-        backoff = _HUB_RECONNECT_BACKOFF_MIN_S
-        while True:
-            try:
-                async with AgentHub.connect(
-                    user=self._hub_user,
-                    url=self._hub_url,
-                    pat=self._hub_pat,
-                    tenant=self._hub_tenant,
-                ) as hub:
-                    hub_tools.set_hub_session(hub)
-                    self._hub = hub
-                    self._pikon_listener = PikonListener(
-                        hub=hub, on_message=self._on_pikon
-                    )
-                    backoff = _HUB_RECONNECT_BACKOFF_MIN_S  # 接続成功でリセット
-                    logger.info("hub_manager: agent-hub に接続しました")
-                    try:
-                        await self._pikon_listener.listen()
-                    finally:
-                        hub_tools.clear_hub_session()
-                        self._hub = None
-                        self._pikon_listener = None
-            except asyncio.CancelledError:
-                # タスクキャンセル (セッション終了) — ループを抜ける
-                raise
-            except Exception as e:
-                logger.warning(
-                    "hub_manager: 切断 (reason: %s) — %.1fs 後に再接続", e, backoff
-                )
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, _HUB_RECONNECT_BACKOFF_MAX_S)
+    def update_hub(self, hub: HubSession) -> None:
+        """hub 再接続時に main.py から呼ばれる。hub 参照と hub_tools を更新する。"""
+        self._hub = hub
+        hub_tools.set_hub_session(hub)
+        logger.info("VoiceSession: hub 参照を更新しました")
 
     # =========================================================================
     # 認証
