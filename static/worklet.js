@@ -31,6 +31,9 @@ class Resampler16kProcessor extends AudioWorkletProcessor {
 
     this.port.onmessage = (e) => {
       if (e.data?.type === 'setMute') {
+        // voice.js から setMute(false) が届くのは worklet が自己リセット (_muted=false)
+        // した後の場合がある (user_activity 発火後に voice.js が同期して送る setMute)。
+        // 二重解除は冪等であり副作用なし。setMute(true) の場合も同様に上書きで正しい。
         this._muted = e.data.value;
       }
     };
@@ -85,7 +88,7 @@ class Resampler16kProcessor extends AudioWorkletProcessor {
   /**
    * Float32 チャンクの RMS (二乗平均平方根) を計算する。
    * @param {number[]} chunk - Float32 サンプル配列
-   * @returns {number} RMS 値 (0.0〜1.0)
+   * @returns {number} RMS 値 (通常 0.0〜1.0、クリップ前処理なしのため 1.0 超の可能性あり)
    */
   _rms(chunk) {
     let sumSq = 0;

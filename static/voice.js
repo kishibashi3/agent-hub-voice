@@ -245,10 +245,16 @@ class VoiceGatewayClient {
   /**
    * worklet から user_activity 通知を受け取ったときの処理。
    * AI 発話中にユーザーが話し始めたと判断し、interrupt を送信する。
+   *
+   * _flushPlayback() を先に呼び再生世代をインクリメントすることで、
+   * まだネットワーク to Promise キューに残っている AI 音声チャンクが
+   * _playAudio() 内で _setAiSpeaking(true) を再呼び出しする競合を防ぐ。
+   * (interrupted 受信時と同じフラッシュ処理)
    */
   _onUserActivity() {
     if (!this._isAiSpeaking) return; // AI 発話中でなければ何もしない
     this._isAiSpeaking = false;
+    this._flushPlayback(); // 残存音声チャンクを捨て、世代インクリメントでミュート再ON を防ぐ
     console.log('[voice-gateway] user activity detected during AI speech — sending interrupt');
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ type: 'interrupt' }));
