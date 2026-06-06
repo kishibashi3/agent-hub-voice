@@ -7,7 +7,7 @@
  *   3. マイク取得 (getUserMedia)
  *   4. AudioWorklet でリサンプリング (48kHz → 16kHz) → WS binary 送信
  *   5. WS binary (24kHz PCM) → AudioContext で再生
- *   6. pikon! / transcript 制御メッセージ処理
+ *   6. pikon! / transcript / interrupted 制御メッセージ処理
  */
 
 'use strict';
@@ -30,11 +30,16 @@ class VoiceGatewayClient {
     // 逐次再生キュー (Promise chain で順番を保証)
     this._playbackQueue = Promise.resolve();
 
+    // 再生世代カウンタ。インタラプト発生時にインクリメントし、
+    // 古い世代のバッファを再生しないようにする。
+    this._playbackGeneration = 0;
+
     // コールバック
     this._onStatusChange = null;  // (status: string) => void
     this._onTranscript = null;    // (speaker: 'user'|'model', text: string) => void
     this._onTurnComplete = null;  // () => void
     this._onPikon = null;         // (from: string, preview: string) => void
+    this._onInterrupted = null;   // () => void
   }
 
   // ---- public API ----------------------------------------------------------
@@ -43,6 +48,7 @@ class VoiceGatewayClient {
   onTranscript(fn)    { this._onTranscript = fn; }
   onTurnComplete(fn)  { this._onTurnComplete = fn; }
   onPikon(fn)         { this._onPikon = fn; }
+  onInterrupted(fn)   { this._onInterrupted = fn; }
 
   /**
    * OTP コードを指定して gateway に接続する。
@@ -131,6 +137,12 @@ class VoiceGatewayClient {
         if (this._onTurnComplete) this._onTurnComplete();
         break;
 
+      case 'interrupted':
+        // AI が発話中にユーザー音声を検知 → 再生キューを即時フラッシュ
+        this._flushPlayback();
+        if (this._onInterrupted) this._onInterrupted();
+        break;
+
       case 'error':
         console.error('[voice-gateway] error:', msg.code, msg.message);
         // session_in_use は専用ステータスで UI に通知 (index.html 側で明確なメッセージを表示)
@@ -195,9 +207,27 @@ class VoiceGatewayClient {
 
   // ---- private: 音声再生 --------------------------------------------------
 
+  /**
+   * インタラプト発生時に呼ぶ。
+   * _playbackGeneration をインクリメントして古い世代のバッファを再生しないようにし、
+   * Promise チェーンも即時リセットする。
+   */
+  _flushPlayback() {
+    this._playbackGeneration++;
+    // チェーンをリセット: 現在再生中の BufferSource は onended まで完走するが
+    // キュー内の未再生バッファは世代チェックで全てスキップされる。
+    this._playbackQueue = Promise.resolve();
+    console.log('[voice-gateway] playback flushed (gen=' + this._playbackGeneration + ')');
+  }
+
   _playAudio(pcmBuffer) {
+    // 現在の世代を捕捉してクロージャに閉じ込める
+    const gen = this._playbackGeneration;
+
     // Promise チェーンで順次再生（バッファが詰まらないように）
     this._playbackQueue = this._playbackQueue.then(async () => {
+      // 世代が変わっていれば stale バッファなので再生せずスキップ
+      if (gen !== this._playbackGeneration) return;
       if (!this.audioCtx) return;
 
       const pcm = new Int16Array(pcmBuffer);

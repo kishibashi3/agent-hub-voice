@@ -255,6 +255,11 @@
       showPikonBanner(from, preview);
     });
 
+    client.onInterrupted(() => {
+      // AI インタラプト: 再生がフラッシュされたことをステータスに反映
+      statusBadge.textContent = '🎙 話しかけてください';
+    });
+
     try {
       await client.connect(code);
     } catch (e) {

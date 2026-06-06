@@ -75,6 +75,14 @@ class VoiceSession:
         self._queue: LiveRequestQueue | None = None
         self._hub = None  # session 中の hub 参照 (_on_pikon での直接返答用)
 
+        # ADK は partial (ストリーミング中チャンク) と non-partial (最終完全テキスト)
+        # 両方の transcription event を yield する。non-partial は partial の集積と
+        # 同じテキストを含むため、両方を送信すると browser で2重表示になる。
+        # partial が送信済みなら non-partial をスキップするためのフラグ。
+        # turn_complete / interrupted でリセットする。
+        self._user_transcript_partial_sent = False
+        self._model_transcript_partial_sent = False
+
     # =========================================================================
     # メインエントリ
     # =========================================================================
@@ -133,6 +141,13 @@ class VoiceSession:
                         voice_name=VOICE_NAME
                     )
                 )
+            ),
+            # Gemini の server-side VAD がユーザー発話を検知したら
+            # 即座にモデルを停止 (デフォルト動作だが明示的に設定)。
+            # これにより AI 発話中にユーザーが話し始めると Gemini 側で
+            # インタラプトが発生し event.interrupted=True イベントが届く。
+            realtime_input_config=types.RealtimeInputConfig(
+                activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
             ),
         )
 
@@ -239,7 +254,14 @@ class VoiceSession:
                 return
 
     def _send_audio_to_queue(self, pcm: bytes) -> None:
-        """PCM 音声データを LiveRequestQueue に送信する (同期)。"""
+        """PCM 音声データを LiveRequestQueue に送信する (同期)。
+
+        AI 発話中も含めて常に送信する。
+        Gemini の server-side VAD (activity_handling=START_OF_ACTIVITY_INTERRUPTS)
+        がユーザー音声を検知したタイミングで自律的にモデルを停止させる。
+        ミュートによるゲートは廃止: ミュートするとユーザー発話が Gemini に届かず
+        VAD が発火しないため、AI が止まらなくなる。
+        """
         queue = self._queue
         if queue is None:
             return
@@ -253,10 +275,18 @@ class VoiceSession:
     async def _handle_control(self, msg: dict) -> None:
         t = msg.get("type")
         if t == "interrupt":
-            logger.info("Interrupt requested")
-            self.is_gemini_speaking = False
-            # NOTE: Gemini Live は現状 interrupt API を未提供。
-            #       セッション再接続で対応する場合は将来実装。
+            # 手動インタラプト (UI ボタン等): activity_start で AI を停止要求。
+            # 通常は Gemini VAD による自律インタラプトで十分だが、
+            # 明示的な停止要求として activity_start を送る。
+            logger.info("Interrupt requested by browser")
+            self.is_gemini_speaking = False  # pikon pending メッセージを即注入させる
+            queue = self._queue
+            if queue:
+                try:
+                    queue.send_activity_start()
+                    logger.info("activity_start sent via explicit browser interrupt")
+                except Exception as e:
+                    logger.error("Failed to send activity_start: %s", e)
         elif t == "stop_session":
             await self.ws.close()
 
@@ -273,6 +303,14 @@ class VoiceSession:
                 live_request_queue=self._queue,
                 run_config=run_config,
             ):
+                # インタラプト: ユーザー発話でモデルが途中停止したことをブラウザに通知
+                # ブラウザ側で _playbackQueue をフラッシュして再生を即止める。
+                if event.interrupted:
+                    self.is_gemini_speaking = False
+                    self._model_transcript_partial_sent = False
+                    await self._send_json({"type": "interrupted"})
+                    logger.info("Model interrupted — sent interrupted to browser")
+
                 # 音声コンテンツをブラウザに転送
                 if event.content and event.content.parts:
                     self.is_gemini_speaking = True
@@ -284,6 +322,11 @@ class VoiceSession:
                                 return  # WS closed
 
                 # トランスクリプト
+                # ADK は partial (streaming chunk) と non-partial (最終完全テキスト)
+                # 両方の transcription event を yield する。
+                # partial を送信済みの場合は non-partial をスキップして browser での
+                # 2重表示を防ぐ。partial が未送信 (ASR が最終結果のみ返すケース) は
+                # non-partial を送信する。
                 # NOTE: ADK バージョンによって transcription フィールドが
                 #       str または .text 属性を持つオブジェクトになる場合がある。
                 #       runtime で正規化して送信する。
@@ -291,24 +334,51 @@ class VoiceSession:
                     text = event.input_transcription
                     if hasattr(text, "text"):
                         text = text.text
-                    await self._send_json({
-                        "type": "transcript",
-                        "speaker": "user",
-                        "text": str(text),
-                    })
+                    text_str = str(text)
+                    if text_str:
+                        if event.partial is True:
+                            self._user_transcript_partial_sent = True
+                            await self._send_json({
+                                "type": "transcript",
+                                "speaker": "user",
+                                "text": text_str,
+                            })
+                        elif not self._user_transcript_partial_sent:
+                            # partial 未送信: non-partial (最終結果) を送信
+                            await self._send_json({
+                                "type": "transcript",
+                                "speaker": "user",
+                                "text": text_str,
+                            })
+                        # else: partial 送信済み → non-partial は集積テキストの重複のためスキップ
+
                 if event.output_transcription:
                     text = event.output_transcription
                     if hasattr(text, "text"):
                         text = text.text
-                    await self._send_json({
-                        "type": "transcript",
-                        "speaker": "model",
-                        "text": str(text),
-                    })
+                    text_str = str(text)
+                    if text_str:
+                        if event.partial is True:
+                            self._model_transcript_partial_sent = True
+                            await self._send_json({
+                                "type": "transcript",
+                                "speaker": "model",
+                                "text": text_str,
+                            })
+                        elif not self._model_transcript_partial_sent:
+                            # partial 未送信: non-partial (最終結果) を送信
+                            await self._send_json({
+                                "type": "transcript",
+                                "speaker": "model",
+                                "text": text_str,
+                            })
+                        # else: partial 送信済み → non-partial は集積テキストの重複のためスキップ
 
-                # ターン完了: browser に通知してから pending メッセージを Gemini context に注入
+                # ターン完了: フラグリセット → browser 通知 → pending メッセージ注入
                 if event.turn_complete:
                     self.is_gemini_speaking = False
+                    self._model_transcript_partial_sent = False
+                    self._user_transcript_partial_sent = False
                     await self._send_json({"type": "turn_complete"})
                     await self._inject_pending_messages()
 
