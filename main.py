@@ -185,8 +185,14 @@ async def _run_hub_with_reconnect() -> None:
     global _active_hub
     backoff = 5.0
 
-    # CommandRouter: /generate-code を登録。未知コマンドは pipeline に yield する。
-    router = CommandRouter(unknown="yield")
+    # CommandRouter: /generate-code を登録。未知スラッシュコマンドは SDK が自動返信。
+    # unknown="reject": 未知の /cmd を受け取ると SDK が reject_format を返信して auto-ack。
+    # bare text (/ なし) は常に "yield" で consumer に届く (セッション有: _on_pikon、無: ack のみ)。
+    _UNKNOWN_CMD_REPLY = (
+        "コマンドが認識できません。\n"
+        "使用可能なコマンド: /generate-code"
+    )
+    router = CommandRouter(unknown="reject", reject_format=_UNKNOWN_CMD_REPLY)
 
     @router.command("/generate-code", description="OTP コードを生成してセッションを開始する")
     async def _handle_generate_code(
