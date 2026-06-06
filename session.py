@@ -358,6 +358,10 @@ class VoiceSession:
                 if event.interrupted:
                     self.is_gemini_speaking = False
                     self._model_transcript_partial_sent = False
+                    # interrupted 後は新たなユーザー発話シーケンスが始まるため
+                    # user transcript フラグもリセットする。
+                    # (turn_complete と非対称だった点を修正 — reviewer 指摘)
+                    self._user_transcript_partial_sent = False
                     await self._send_json({"type": "interrupted"})
                     logger.info("Model interrupted — sent interrupted to browser")
 
